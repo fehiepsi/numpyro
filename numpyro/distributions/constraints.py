@@ -331,7 +331,8 @@ class SigmoidTransform(Transform):
         return logit(y)
 
     def log_abs_det_jacobian(self, x, y):
-        return np.log(y * (1 - y))
+        x_abs = np.abs(x)
+        return -x_abs - 2 * np.log1p(np.exp(-x_abs))
 
 
 class StickBreakingTransform(Transform):
