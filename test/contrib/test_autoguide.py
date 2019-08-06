@@ -116,17 +116,17 @@ def test_uniform_normal():
 
 def test_dynamic_supports():
     true_coef = 0.9
-    data = true_coef + random.normal(random.PRNGKey(0), (1000,))
+    data = true_coef + random.normal(random.PRNGKey(0), (10,))
 
     def actual_model(data):
         alpha = sample('alpha', dist.Uniform(0, 1))
         loc = sample('loc', dist.Uniform(0, alpha))
-        sample('obs', dist.Normal(loc, 0.1), obs=data)
+        sample('obs', dist.Normal(loc, 0.01), obs=data)
 
     def expected_model(data):
         alpha = sample('alpha', dist.Uniform(0, 1))
         loc = sample('loc', dist.Uniform(0, 1)) * alpha
-        sample('obs', dist.Normal(loc, 0.1), obs=data)
+        sample('obs', dist.Normal(loc, 0.01), obs=data)
 
     opt_init, opt_update, get_params = optimizers.adam(0.01)
     rng_guide, rng_init, rng_train = random.split(random.PRNGKey(1), 3)
