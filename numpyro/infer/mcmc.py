@@ -828,7 +828,8 @@ class MCMC(object):
         """
         samples = self._states['z']
         if self._collect_warmup and skip_warmup:
-            samples = tree_map(lambda x: x[self.num_warmup:], samples)
+            print("aaa", self.num_warmup)
+            samples = tree_map(lambda x: x[:, self.num_warmup:], samples)
         if not group_by_chain:
             samples = tree_map(lambda x: np.reshape(x, (-1,) + x.shape[2:]), samples)
         return samples
@@ -846,7 +847,7 @@ class MCMC(object):
         """
         extra_fields = {k: v for k, v in self._states.items() if k != 'z'}
         if self._collect_warmup and skip_warmup:
-            extra_fields = tree_map(lambda x: x[self.num_warmup:], extra_fields)
+            extra_fields = tree_map(lambda x: x[:, self.num_warmup:], extra_fields)
         if not group_by_chain:
             extra_fields = tree_map(lambda x: np.reshape(x, (-1,) + x.shape[2:]), extra_fields)
         return extra_fields

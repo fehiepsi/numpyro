@@ -385,3 +385,19 @@ def test_extra_fields():
     assert stats['num_steps'].shape == (1, 1000)
     assert 'adapt_state.step_size' in stats
     assert stats['adapt_state.step_size'].shape == (1, 1000)
+
+
+@pytest.mark.parametrize('group_by_chain', [True, False])
+@pytest.mark.parametrize('skip_warmup', [True, False])
+@pytest.mark.parametrize('collect_warmup', [True, False])
+def test_get_samples(collect_warmup, group_by_chain, skip_warmup):
+    def model():
+        numpyro.sample('x', dist.Normal(0, 1), sample_shape=(5,))
+
+    num_warmup, num_samples = 500, 1000
+    mcmc = MCMC(NUTS(model), num_warmup, num_samples, progress_bar=False)
+    mcmc.run(random.PRNGKey(0), extra_fields=['num_steps'], collect_warmup=collect_warmup)
+    samples = mcmc.get_samples(group_by_chain=group_by_chain, skip_warmup=skip_warmup)
+    n = num_warmup + num_samples if (collect_warmup and not skip_warmup) else num_samples
+    extected_shape = (1, n, 5) if group_by_chain else (n, 5)
+    assert samples['x'].shape == extected_shape
