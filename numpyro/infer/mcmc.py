@@ -723,7 +723,7 @@ class MCMC(object):
             self.progress_bar = False
 
         self._states = None
-        self._states_flat = None
+        self._collect_warmup = None
 
     def _single_chain_mcmc(self, init, collect_fields=('z',), collect_warmup=False, args=(), kwargs={}):
         rng, init_params = init
@@ -767,6 +767,7 @@ class MCMC(object):
         """
         self._args = args
         self._kwargs = kwargs
+        self._collect_warmup = collect_warmup
         chain_method = self.chain_method
         if chain_method == 'parallel' and xla_bridge.device_count() < self.num_chains:
             chain_method = 'sequential'
@@ -810,34 +811,46 @@ class MCMC(object):
             if chain_method == 'vectorized':
                 # swap num_samples x num_chains to num_chains x num_samples
                 states = tree_map(lambda x: np.swapaxes(x, 0, 1), states)
-            states_flat = tree_map(lambda x: np.reshape(x, (-1,) + x.shape[2:]), states)
         self._states = states
-        self._states_flat = states_flat
 
-    def get_samples(self, group_by_chain=False):
+    def get_samples(self, group_by_chain=False, skip_warmup=False):
         """
         Get samples from the MCMC run.
 
         :param bool group_by_chain: Whether to preserve the chain dimension. If True,
             all samples will have num_chains as the size of their leading dimension.
+        :param bool skip_warmup: Wheter to skip warmup samples if `collect_warmup=True`
+            in :meth:`run` method.
         :return: Samples having the same data type as `init_params`. The data type is a
             `dict` keyed on site names if a model containing Pyro primitives is used,
             but can be any :func:`jaxlib.pytree`, more generally (e.g. when defining a
             `potential_fn` for HMC that takes `list` args).
         """
-        return self._states['z'] if group_by_chain else self._states_flat['z']
+        samples = self._states['z']
+        if self._collect_warmup and skip_warmup:
+            samples = tree_map(lambda x: x[self.num_warmup:], samples)
+        if not group_by_chain:
+            samples = tree_map(lambda x: np.reshape(x, (-1,) + x.shape[2:]), samples)
+        return samples
 
-    def get_extra_fields(self, group_by_chain=False):
+    def get_extra_fields(self, group_by_chain=False, skip_warmup=False):
         """
         Get extra fields from the MCMC run.
 
         :param bool group_by_chain: Whether to preserve the chain dimension. If True,
             all samples will have num_chains as the size of their leading dimension.
+        :param bool skip_warmup: Wheter to skip warmup samples if `collect_warmup=True`
+            in :meth:`run` method.
         :return: Extra fields keyed by field names which are specified in the
             `extra_fields` keyword of :meth:`run`.
         """
-        states = self._states if group_by_chain else self._states_flat
-        return {k: v for k, v in states.items() if k != 'z'}
+        extra_fields = {k: v for k, v in self._states.items() if k != 'z'}
+        if self._collect_warmup and skip_warmup:
+            extra_fields = tree_map(lambda x: x[self.num_warmup:], extra_fields)
+        if not group_by_chain:
+            extra_fields = tree_map(lambda x: np.reshape(x, (-1,) + x.shape[2:]), extra_fields)
+        return extra_fields
 
     def print_summary(self, prob=0.9):
-        summary(self._states['z'], prob=prob)
+        samples = self.get_samples(group_by_chain=True, skip_warmup=True)
+        summary(samples, prob=prob)
