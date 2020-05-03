@@ -267,8 +267,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
         r = momentum_generator(wa_state.mass_matrix_sqrt, rng_key_momentum)
         vv_init, vv_update = velocity_verlet(pe_fn, kinetic_fn)
         vv_state = vv_init(z, r)
-        energy = kinetic_fn(wa_state.inverse_mass_matrix, vv_state.r)
-        hmc_state = HMCState(0, vv_state.z, vv_state.z_grad, vv_state.potential_energy, energy,
+        hmc_state = HMCState(0, vv_state.z, vv_state.z_grad, vv_state.potential_energy, 0.,
                              0, 0., 0., False, wa_state, rng_key_hmc)
         return device_put(hmc_state)
 
@@ -516,11 +515,13 @@ class HMC(MCMCKernel):
                              ' `potential_fn`.')
         # Find valid initial params
         if self._model and not init_params:
+            print('find valid')
             init_params, is_valid = find_valid_initial_params(rng_key, self._model,
                                                               init_strategy=self._init_strategy,
                                                               param_as_improper=True,
                                                               model_args=model_args,
                                                               model_kwargs=model_kwargs)
+            print('find valid')
             if not_jax_tracer(is_valid):
                 if device_get(~np.all(is_valid)):
                     raise RuntimeError("Cannot find valid initial parameters. "
@@ -1083,6 +1084,10 @@ class MCMC(object):
 
     def _single_chain_mcmc(self, rng_key, init_state, init_params, args, kwargs, collect_fields=('z',)):
         if init_state is None:
+            # XXX: for multiple chains, we might want to separate out this step
+            # because it is faster to do pmap(get_init_state) and pmap(sampling)
+            # than pmap(get_init_state + sampling).
+            # Note that JAX compiling time is nonlinear w.r.t. jaxpr
             init_state = self.sampler.init(rng_key, self.num_warmup, init_params,
                                            model_args=args, model_kwargs=kwargs)
         if self.postprocess_fn is None:

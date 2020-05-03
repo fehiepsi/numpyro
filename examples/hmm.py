@@ -119,6 +119,7 @@ def semi_supervised_hmm(transition_prior, emission_prior,
     log_prob = forward_log_prob(init_log_prob, unsupervised_words[1:],
                                 transition_log_prob, emission_log_prob)
     log_prob = logsumexp(log_prob, axis=0, keepdims=True)
+    print("travelling")
     # inject log_prob to potential function
     numpyro.factor('forward_log_prob', log_prob)
 
@@ -158,7 +159,7 @@ def main(args):
     rng_key = random.PRNGKey(2)
     start = time.time()
     kernel = NUTS(semi_supervised_hmm)
-    mcmc = MCMC(kernel, args.num_warmup, args.num_samples,
+    mcmc = MCMC(kernel, args.num_warmup, args.num_samples, num_chains=args.num_chains,
                 progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
     mcmc.run(rng_key, transition_prior, emission_prior, supervised_categories,
              supervised_words, unsupervised_words)

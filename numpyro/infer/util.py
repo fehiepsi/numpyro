@@ -362,6 +362,7 @@ def find_valid_initial_params(rng_key, model,
         # Early return if valid params found.
         if not_jax_tracer(is_valid):
             if device_get(is_valid):
+                print("it is valid")
                 return prototype_params, is_valid
 
         _, _, init_params, is_valid = while_loop(cond_fn, body_fn, init_state)
