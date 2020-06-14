@@ -48,9 +48,11 @@ from numpyro.distributions.discrete import (
     PRNGIdentity,
     ZeroInflatedPoisson
 )
+from numpyro.distributions.directional import VonMises
 from numpyro.distributions.distribution import (
     Distribution,
     ExpandedDistribution,
+    ImproperUniform,
     Independent,
     MaskedDistribution,
     TransformedDistribution,
@@ -87,6 +89,7 @@ __all__ = [
     'Gumbel',
     'HalfCauchy',
     'HalfNormal',
+    'ImproperUniform',
     'Independent',
     'InverseGamma',
     'LKJ',
@@ -111,6 +114,7 @@ __all__ = [
     'TruncatedPolyaGamma',
     'Uniform',
     'Unit',
+    'VonMises',
     'ZeroInflatedPoisson',
 
 ]
