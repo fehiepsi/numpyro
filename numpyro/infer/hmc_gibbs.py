@@ -530,7 +530,7 @@ class HMCECS(HMCGibbs):
 
 class control_variate(numpyro.primitives.Messenger):
     def __init__(self, fn=None, estimator=None):
-        # estimator: accept likelihood tuple (fn, value, scale, subsample_dim, subsample_idx)
+        # estimator: accept likelihood tuple (fn, value, subsample_dim, subsample_idx)
         # and current unconstrained params
         # and returns log of the bias-corrected likelihood
         assert estimator is not None
@@ -624,7 +624,7 @@ def taylor_estimator(model, model_args, model_kwargs, reference_params):
 
     def estimator(likelihoods, params):
         subsample_log_lik = 0.
-        for (fn, value, scale, subsample_dim, subsample_idx) in likelihoods.values():
+        for (fn, value, subsample_dim, subsample_idx) in likelihoods.values():
             subsample_log_lik = subsample_log_lik + _sum_all_except_at_dim(fn.log_prob(value), subsample_dim)
 
         params_flat, _ = ravel_pytree(params)
