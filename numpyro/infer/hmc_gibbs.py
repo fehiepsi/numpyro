@@ -631,7 +631,7 @@ def taylor_estimator(model, model_args, model_kwargs, reference_params):
         params_diff = params_flat - ref_params_flat
         ref_subsample_log_lik = ref_log_likelihoods[subsample_idx] + \
             jnp.dot(ref_log_likelihood_grads[subsample_idx], params_diff) + \
-            0.5 * jnp.dot(jnp.dot(ref_log_likelihood_grads[subsample_idx], params_diff), params_diff)
+            0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians[subsample_idx], params_diff), params_diff)
         diff = subsample_log_lik - ref_subsample_log_lik
 
         control_variates_sum = ref_log_likelihoods_sum + \
