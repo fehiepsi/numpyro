@@ -5,10 +5,11 @@ from collections import namedtuple
 import copy
 from functools import partial
 
-from jax import device_put, jacfwd, grad, ops, random, value_and_grad
+from jax import device_put, jacfwd, jacobian, grad, hessian, ops, random, value_and_grad
 import jax.numpy as jnp
 from jax.scipy.special import expit
 
+import numpyro
 from numpyro.handlers import condition, seed, substitute, trace
 from numpyro.infer.hmc import HMC
 from numpyro.infer.mcmc import MCMCKernel
@@ -476,9 +477,11 @@ class HMCECS(HMCGibbs):
         >>> assert abs(jnp.mean(samples) - 1.) < 0.1
 
     """
-    def __init__(self, inner_kernel, *, num_blocks=1):
+    def __init__(self, inner_kernel, *, num_blocks=1, reference_params=None):
         super().__init__(inner_kernel, lambda *args: None, None)
         self._num_blocks = num_blocks
+        # TODO: for users, it might be better to expose reference_values (constrained space)
+        self._reference_params = reference_params
 
     def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
         model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
@@ -490,6 +493,8 @@ class HMCECS(HMCGibbs):
             if site["type"] == "plate" and site["args"][0] > site["args"][1]  # i.e. size > subsample_size
         }
         self._gibbs_sites = list(self._plate_sizes.keys())
+        estimator = taylor_estimator(self.model, model_args, model_kwargs, self._reference_params)
+        self.inner_kernel._model = control_variate(self.inner_kernel._model, estimator)
         return super().init(rng_key, num_warmup, init_params, model_args, model_kwargs)
 
     def sample(self, state, model_args, model_kwargs):
@@ -521,3 +526,119 @@ class HMCECS(HMCGibbs):
         z = {**z_gibbs, **hmc_state.z}
 
         return HMCGibbsState(z, hmc_state, rng_key)
+
+
+class control_variate(numpyro.primitives.Messenger):
+    def __init__(self, fn=None, estimator=None):
+        # estimator: accept likelihood tuple (fn, value, scale, subsample_dim, subsample_idx)
+        # and current unconstrained params
+        # and returns log of the bias-corrected likelihood
+        assert estimator is not None
+        super().__init__(fn)
+        self.estimator = estimator
+        self.params = None
+        self.likelihoods = {}
+        self.subsample_plates = {}
+
+    def __enter__(self):
+        for handler in numpyro.primitives._PYRO_STACK:
+            if isinstance(handler, substitute) and isinstance(handler.substitute_fn, partial):
+                self.params = handler.substitute_fn.args[0]
+                break
+        return super().__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # make sure exit trackback is nice if an error happens
+        super().__exit__(exc_type, exc_value, traceback)
+        if exc_type is not None:
+            return
+
+        if self.params is None:
+            return
+
+        # add numpyro.factor; ideally, we will want to skip this computation when making prediction
+        # see: https://github.com/pyro-ppl/pyro/issues/2744
+        names = list(self.subsample_plates.keys())
+        assert len(names) == 1, "Multiple subsample sites are not supported yet."
+        numpyro.factor(f"_{names[0]}_log_likelihood", self.estimator(self.likelihoods, self.params))
+
+        # clean up
+        self.params = None
+        self.likelihoods = {}
+        self.subsample_plates = {}
+
+    def process_message(self, msg):
+        if self.params is None:
+            return
+
+        if msg["type"] == "sample" and msg["is_observed"]:
+            assert msg["name"] not in self.params
+            # store the likelihood for the estimator
+            for frame in msg["cond_indep_stack"]:
+                if frame.name in self.subsample_plates:
+                    if msg["name"] in self.likelihoods:
+                        raise RuntimeError("Multiple subsample sites are not supported yet.")
+                    subsample = self.subsample_plates[frame.name]
+                    self.likelihoods[msg["name"]] = (msg["fn"], msg["value"], frame.dim, subsample)
+            # mask the current likelihood
+            msg["fn"] = msg["fn"].mask(False)
+        elif msg["type"] == "plate" and msg["args"][0] > msg["args"][1]:
+            self.subsample_plates[msg["name"]] = msg["value"]
+
+
+def taylor_estimator(model, model_args, model_kwargs, reference_params):
+    ref_params_flat, unravel_fn = ravel_pytree(reference_params)
+
+    def _sum_all_except_at_dim(x, dim):
+        x = x.reshape((-1,) + x.shape[dim:]).sum(0)
+        return x.reshape(x.shape[:1] + (-1,)).sum(-1)
+
+    def log_likelihood(params_flat):
+        from numpyro.infer.util import _unconstrain_reparam
+
+        params = unravel_fn(params_flat)
+        with trace() as tr, substitute(model, substitute_fn=partial(_unconstrain_reparam, params)):
+            model(*model_args, **model_kwargs)
+
+        subsample_sites = [name for name, site in tr.items()
+                           if site["type"] == "plate" and site["args"][0] > site["args"][1]]
+        assert len(subsample_sites) == 1
+        subsample_site = subsample_sites[0]
+
+        log_lik = 0.
+        for site in tr.values():
+            if site["type"] == "sample" and site["is_observed"]:
+                plate_dims = {frame.name: frame.dim for frame in site["cond_indep_stack"]}
+                if subsample_site in plate_dims:
+                    dim = plate_dims[subsample_site]
+                    log_lik = log_lik + _sum_all_except_at_dim(site["fn"].log_prob(site["value"]), dim)
+        return log_lik
+
+    ref_log_likelihoods = log_likelihood(ref_params_flat)
+    ref_log_likelihood_grads = jacobian(log_likelihood)(ref_params_flat)
+    ref_log_likelihood_hessians = hessian(log_likelihood)(ref_params_flat)
+    ref_log_likelihoods_sum = ref_log_likelihoods.sum(0)
+    ref_log_likelihood_grads_sum = ref_log_likelihood_grads.sum(0)
+    ref_log_likelihood_hessians_sum = ref_log_likelihood_hessians.sum(0)
+    n = ref_log_likelihoods.shape[0]
+
+    def estimator(likelihoods, params):
+        subsample_log_lik = 0.
+        for (fn, value, scale, subsample_dim, subsample_idx) in likelihoods.values():
+            subsample_log_lik = subsample_log_lik + _sum_all_except_at_dim(fn.log_prob(value), subsample_dim)
+
+        params_flat, _ = ravel_pytree(params)
+        params_diff = params_flat - ref_params_flat
+        ref_subsample_log_lik = ref_log_likelihoods[subsample_idx] + \
+            jnp.dot(ref_log_likelihood_grads[subsample_idx], params_diff) + \
+            0.5 * jnp.dot(jnp.dot(ref_log_likelihood_grads[subsample_idx], params_diff), params_diff)
+        diff = subsample_log_lik - ref_subsample_log_lik
+
+        control_variates_sum = ref_log_likelihoods_sum + \
+            jnp.dot(ref_log_likelihood_grads_sum, params_diff) + \
+            0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sum, params_diff), params_diff)
+        unbiased_log_lik = control_variates_sum + n * jnp.mean(diff)
+        variance = n ** 2 / diff.shape[0] * jnp.var(diff)
+        return unbiased_log_lik - 0.5 * variance
+
+    return estimator
