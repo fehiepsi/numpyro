@@ -4,6 +4,7 @@
 from collections import namedtuple
 import copy
 from functools import partial
+import warnings
 
 from jax import device_put, jacfwd, jacobian, grad, hessian, ops, random, value_and_grad
 import jax.numpy as jnp
@@ -493,7 +494,8 @@ class HMCECS(HMCGibbs):
             if site["type"] == "plate" and site["args"][0] > site["args"][1]  # i.e. size > subsample_size
         }
         self._gibbs_sites = list(self._plate_sizes.keys())
-        estimator = taylor_estimator(self.model, model_args, model_kwargs, self._reference_params)
+        estimator = taylor_estimator(self.model, model_args, model_kwargs,
+                                     self._plate_sizes, self._reference_params)
         self.inner_kernel._model = control_variate(self.inner_kernel._model, estimator)
         return super().init(rng_key, num_warmup, init_params, model_args, model_kwargs)
 
@@ -586,8 +588,9 @@ class control_variate(numpyro.primitives.Messenger):
             self.subsample_plates[msg["name"]] = msg["value"]
 
 
-def taylor_estimator(model, model_args, model_kwargs, reference_params):
+def taylor_estimator(model, model_args, model_kwargs, plate_sizes, reference_params):
     ref_params_flat, unravel_fn = ravel_pytree(reference_params)
+    plate_sites = {k: jnp.arange(v) for k, v in plate_sizes}
 
     def _sum_all_except_at_dim(x, dim):
         x = x.reshape((-1,) + x.shape[dim:]).sum(0)
@@ -597,8 +600,10 @@ def taylor_estimator(model, model_args, model_kwargs, reference_params):
         from numpyro.infer.util import _unconstrain_reparam
 
         params = unravel_fn(params_flat)
-        with trace() as tr, substitute(model, substitute_fn=partial(_unconstrain_reparam, params)):
-            model(*model_args, **model_kwargs)
+        with warnings.catch_warnings():
+            with trace() as tr, substitute(data=plate_sites), \
+                    substitute(model, substitute_fn=partial(_unconstrain_reparam, params)):
+                model(*model_args, **model_kwargs)
 
         subsample_sites = [name for name, site in tr.items()
                            if site["type"] == "plate" and site["args"][0] > site["args"][1]]
