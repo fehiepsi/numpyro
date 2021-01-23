@@ -240,3 +240,18 @@ def test_enum_subsample_smoke():
     kernel = HMCECS(NUTS(model), num_blocks=10)
     mcmc = MCMC(kernel, 10, 10)
     mcmc.run(random.PRNGKey(0), data)
+
+
+def test_control_variate():
+    def model(data):
+        x = numpyro.sample("x", dist.Normal(0, 1))
+        with numpyro.plate("N", data.shape[0], subsample_size=100):
+            batch = numpyro.subsample(data, event_dim=0)
+            numpyro.sample("obs", dist.Normal(x, 1), obs=batch)
+
+    data = random.normal(random.PRNGKey(0), (10000,)) + 1
+    kernel = HMCECS(NUTS(model), num_blocks=10, reference_params={"x": 1.})
+    mcmc = MCMC(kernel, 1000, 1000)
+    mcmc.run(random.PRNGKey(0), data)
+    samples = mcmc.get_samples()["x"]
+    assert abs(jnp.mean(samples) - 1.) < 0.1

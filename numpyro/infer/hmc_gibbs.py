@@ -1,12 +1,12 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 import copy
 from functools import partial
 import warnings
 
-from jax import device_put, jacfwd, jacobian, grad, hessian, ops, random, value_and_grad
+from jax import device_put, jacfwd, grad, ops, random, value_and_grad
 import jax.numpy as jnp
 from jax.scipy.special import expit
 
@@ -488,15 +488,16 @@ class HMCECS(HMCGibbs):
         model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
         rng_key, key_u = random.split(rng_key)
         self._prototype_trace = trace(seed(self.model, key_u)).get_trace(*model_args, **model_kwargs)
-        self._plate_sizes = {
+        self._subsample_plate_sizes = {
             name: site["args"]
             for name, site in self._prototype_trace.items()
             if site["type"] == "plate" and site["args"][0] > site["args"][1]  # i.e. size > subsample_size
         }
-        self._gibbs_sites = list(self._plate_sizes.keys())
-        estimator = taylor_estimator(self.model, model_args, model_kwargs,
-                                     self._plate_sizes, self._reference_params)
-        self.inner_kernel._model = control_variate(self.inner_kernel._model, estimator)
+        self._gibbs_sites = list(self._subsample_plate_sizes.keys())
+        if self._reference_params is not None:
+            estimator = taylor_estimator(self.model, model_args, model_kwargs,
+                                         self._subsample_plate_sizes, self._reference_params)
+            self.inner_kernel._model = control_variate(self.inner_kernel._model, estimator)
         return super().init(rng_key, num_warmup, init_params, model_args, model_kwargs)
 
     def sample(self, state, model_args, model_kwargs):
@@ -512,7 +513,7 @@ class HMCECS(HMCGibbs):
         model_kwargs_ = model_kwargs.copy()
         model_kwargs_["_gibbs_sites"] = z_gibbs
 
-        gibbs_fn = _subsample_gibbs_fn(potential_fn, self._plate_sizes, self._num_blocks)
+        gibbs_fn = _subsample_gibbs_fn(potential_fn, self._subsample_plate_sizes, self._num_blocks)
         z_gibbs, pe = gibbs_fn(rng_key=rng_gibbs, gibbs_sites=z_gibbs, hmc_sites=z_hmc,
                                pe=state.hmc_state.potential_energy)
 
@@ -532,7 +533,7 @@ class HMCECS(HMCGibbs):
 
 class control_variate(numpyro.primitives.Messenger):
     def __init__(self, fn=None, estimator=None):
-        # estimator: accept likelihood tuple (fn, value, subsample_dim, subsample_idx)
+        # estimator: accept likelihood tuple (fn, value, subsample_name, subsample_dim, subsample_idx)
         # and current unconstrained params
         # and returns log of the bias-corrected likelihood
         assert estimator is not None
@@ -560,9 +561,7 @@ class control_variate(numpyro.primitives.Messenger):
 
         # add numpyro.factor; ideally, we will want to skip this computation when making prediction
         # see: https://github.com/pyro-ppl/pyro/issues/2744
-        names = list(self.subsample_plates.keys())
-        assert len(names) == 1, "Multiple subsample sites are not supported yet."
-        numpyro.factor(f"_{names[0]}_log_likelihood", self.estimator(self.likelihoods, self.params))
+        numpyro.factor("_biased_corrected_log_likelihood", self.estimator(self.likelihoods, self.params))
 
         # clean up
         self.params = None
@@ -579,18 +578,18 @@ class control_variate(numpyro.primitives.Messenger):
             for frame in msg["cond_indep_stack"]:
                 if frame.name in self.subsample_plates:
                     if msg["name"] in self.likelihoods:
-                        raise RuntimeError("Multiple subsample sites are not supported yet.")
-                    subsample = self.subsample_plates[frame.name]
-                    self.likelihoods[msg["name"]] = (msg["fn"], msg["value"], frame.dim, subsample)
+                        raise RuntimeError(f"Multiple subsample plates at site {msg['name']} "
+                                           "are not allowed. Please reshape your data.")
+                    subsample_idx = self.subsample_plates[frame.name]
+                    self.likelihoods[msg["name"]] = (msg["fn"], msg["value"], frame.name, frame.dim, subsample_idx)
             # mask the current likelihood
             msg["fn"] = msg["fn"].mask(False)
         elif msg["type"] == "plate" and msg["args"][0] > msg["args"][1]:
             self.subsample_plates[msg["name"]] = msg["value"]
 
 
-def taylor_estimator(model, model_args, model_kwargs, plate_sizes, reference_params):
+def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, reference_params):
     ref_params_flat, unravel_fn = ravel_pytree(reference_params)
-    plate_sites = {k: jnp.arange(v) for k, v in plate_sizes}
 
     def _sum_all_except_at_dim(x, dim):
         x = x.reshape((-1,) + x.shape[dim:]).sum(0)
@@ -601,49 +600,51 @@ def taylor_estimator(model, model_args, model_kwargs, plate_sizes, reference_par
 
         params = unravel_fn(params_flat)
         with warnings.catch_warnings():
-            with trace() as tr, substitute(data=plate_sites), \
-                    substitute(model, substitute_fn=partial(_unconstrain_reparam, params)):
+            warnings.simplefilter("ignore")
+            with trace() as tr, substitute(substitute_fn=partial(_unconstrain_reparam, params)), \
+                    substitute(data={k: jnp.arange(v[0]) for k, v in subsample_plate_sizes.items()}):
                 model(*model_args, **model_kwargs)
 
-        subsample_sites = [name for name, site in tr.items()
-                           if site["type"] == "plate" and site["args"][0] > site["args"][1]]
-        assert len(subsample_sites) == 1
-        subsample_site = subsample_sites[0]
-
-        log_lik = 0.
+        log_lik = defaultdict(float)
         for site in tr.values():
             if site["type"] == "sample" and site["is_observed"]:
-                plate_dims = {frame.name: frame.dim for frame in site["cond_indep_stack"]}
-                if subsample_site in plate_dims:
-                    dim = plate_dims[subsample_site]
-                    log_lik = log_lik + _sum_all_except_at_dim(site["fn"].log_prob(site["value"]), dim)
+                for frame in site["cond_indep_stack"]:
+                    if frame.name in subsample_plate_sizes:
+                        log_lik[frame.name] += _sum_all_except_at_dim(
+                            site["fn"].log_prob(site["value"]), frame.dim)
         return log_lik
 
+    # those stats are dict keyed by subsample names
     ref_log_likelihoods = log_likelihood(ref_params_flat)
-    ref_log_likelihood_grads = jacobian(log_likelihood)(ref_params_flat)
-    ref_log_likelihood_hessians = hessian(log_likelihood)(ref_params_flat)
-    ref_log_likelihoods_sum = ref_log_likelihoods.sum(0)
-    ref_log_likelihood_grads_sum = ref_log_likelihood_grads.sum(0)
-    ref_log_likelihood_hessians_sum = ref_log_likelihood_hessians.sum(0)
-    n = ref_log_likelihoods.shape[0]
+    # NB: use jacfwd (instead of jacobian/jacrev) when out_dim >> in_dim
+    ref_log_likelihood_grads = jacfwd(log_likelihood)(ref_params_flat)
+    ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)
+    ref_log_likelihoods_sum = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
+    ref_log_likelihood_grads_sum = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
+    ref_log_likelihood_hessians_sum = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}
 
     def estimator(likelihoods, params):
-        subsample_log_lik = 0.
-        for (fn, value, subsample_dim, subsample_idx) in likelihoods.values():
-            subsample_log_lik = subsample_log_lik + _sum_all_except_at_dim(fn.log_prob(value), subsample_dim)
+        subsample_log_liks = defaultdict(float)
+        for (fn, value, name, subsample_dim, subsample_idx) in likelihoods.values():
+            subsample_log_liks[name] += _sum_all_except_at_dim(fn.log_prob(value), subsample_dim)
 
         params_flat, _ = ravel_pytree(params)
         params_diff = params_flat - ref_params_flat
-        ref_subsample_log_lik = ref_log_likelihoods[subsample_idx] + \
-            jnp.dot(ref_log_likelihood_grads[subsample_idx], params_diff) + \
-            0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians[subsample_idx], params_diff), params_diff)
-        diff = subsample_log_lik - ref_subsample_log_lik
+        log_lik_sum = 0.
+        # loop over all subsample sites
+        for name, subsample_log_lik in subsample_log_liks.items():
+            n, m = subsample_plate_sizes[name]
+            ref_subsample_log_lik = ref_log_likelihoods[name][subsample_idx] + \
+                jnp.dot(ref_log_likelihood_grads[name][subsample_idx], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians[name][subsample_idx], params_diff), params_diff)
+            diff = subsample_log_lik - ref_subsample_log_lik
 
-        control_variates_sum = ref_log_likelihoods_sum + \
-            jnp.dot(ref_log_likelihood_grads_sum, params_diff) + \
-            0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sum, params_diff), params_diff)
-        unbiased_log_lik = control_variates_sum + n * jnp.mean(diff)
-        variance = n ** 2 / diff.shape[0] * jnp.var(diff)
-        return unbiased_log_lik - 0.5 * variance
+            control_variates_sum = ref_log_likelihoods_sum[name] + \
+                jnp.dot(ref_log_likelihood_grads_sum[name], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sum[name], params_diff), params_diff)
+            unbiased_log_lik = control_variates_sum + n * jnp.mean(diff)
+            variance = n ** 2 / m * jnp.var(diff)
+            log_lik_sum += unbiased_log_lik - 0.5 * variance
+        return log_lik_sum
 
     return estimator
