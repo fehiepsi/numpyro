@@ -677,8 +677,8 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
                 jnp.dot(ref_log_likelihood_grads_sum[name], params_diff) + \
                 0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sum[name], params_diff), params_diff)
             unbiased_log_lik = control_variates_sum + n * jnp.mean(diff)
-            # variance = n ** 2 / m * jnp.var(diff)
-            log_lik_sum += unbiased_log_lik  # - 0.5 * variance
+            variance = n ** 2 / m * jnp.var(diff)
+            log_lik_sum += unbiased_log_lik - 0.5 * variance
         return log_lik_sum
 
     return estimator
