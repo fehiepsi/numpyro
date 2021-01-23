@@ -6,12 +6,12 @@ import copy
 from functools import partial
 import warnings
 
-from jax import device_put, jacfwd, grad, ops, random, value_and_grad
+from jax import device_put, jacfwd, jacobian, grad, hessian, ops, random, value_and_grad
 import jax.numpy as jnp
 from jax.scipy.special import expit
 
 import numpyro
-from numpyro.handlers import condition, seed, substitute, trace
+from numpyro.handlers import block, condition, seed, substitute, trace
 from numpyro.infer.hmc import HMC
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import _unconstrain_reparam
@@ -479,11 +479,12 @@ class HMCECS(HMCGibbs):
         >>> assert abs(jnp.mean(samples) - 1.) < 0.1
 
     """
-    def __init__(self, inner_kernel, *, num_blocks=1, reference_params=None):
+    def __init__(self, inner_kernel, *, num_blocks=1, reference_params=None, using_lookup=False):
         super().__init__(inner_kernel, lambda *args: None, None)
         self._num_blocks = num_blocks
         # TODO: for users, it might be better to expose reference_values (constrained space)
         self._reference_params = reference_params
+        self._using_lookup = using_lookup
 
     def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
         model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
@@ -497,7 +498,7 @@ class HMCECS(HMCGibbs):
         self._gibbs_sites = list(self._subsample_plate_sizes.keys())
         if self._reference_params is not None:
             estimator = taylor_estimator(self.model, model_args, model_kwargs,
-                                         self._subsample_plate_sizes, self._reference_params)
+                                         self._subsample_plate_sizes, self._reference_params, self._using_lookup)
             self.inner_kernel._model = control_variate(self.inner_kernel._model, estimator)
         return super().init(rng_key, num_warmup, init_params, model_args, model_kwargs)
 
@@ -591,7 +592,7 @@ class control_variate(numpyro.primitives.Messenger):
             self.subsample_plates[msg["name"]] = msg["value"]
 
 
-def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, reference_params):
+def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, reference_params, using_lookup=False):
     # subsample_plate_sizes: name -> (size, subsample_size)
     ref_params_flat, unravel_fn = ravel_pytree(reference_params)
 
@@ -599,12 +600,14 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
         x = x.reshape((-1,) + x.shape[dim:]).sum(0)
         return x.reshape(x.shape[:1] + (-1,)).sum(-1)
 
-    def log_likelihood(params_flat):
+    def log_likelihood(params_flat, subsample_indices=None):
+        if subsample_indices is None:
+            subsample_indices = {k: jnp.arange(v[0]) for k, v in subsample_plate_sizes.items()}
         params = unravel_fn(params_flat)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with trace() as tr, substitute(substitute_fn=partial(_unconstrain_reparam, params)), \
-                    substitute(data={k: jnp.arange(v[0]) for k, v in subsample_plate_sizes.items()}):
+            with block(), trace() as tr, substitute(data=subsample_indices), \
+                    substitute(substitute_fn=partial(_unconstrain_reparam, params)):
                 model(*model_args, **model_kwargs)
 
         log_lik = defaultdict(float)
@@ -616,41 +619,66 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
                             site["fn"].log_prob(site["value"]), frame.dim)
         return log_lik
 
+    def log_likelihood_sum(params_flat, subsample_indices=None):
+        return {k: v.sum() for k, v in log_likelihood(params_flat, subsample_indices).items()}
+
     # those stats are dict keyed by subsample names
-    ref_log_likelihoods = log_likelihood(ref_params_flat)  # n
-    # NB: use jacfwd (instead of jacobian/jacrev) when out_dim >> in_dim
-    ref_log_likelihood_grads = jacfwd(log_likelihood)(ref_params_flat)
-    # TODO: resolve memory error for covtype data: data 500,000, params: 55
-    # fn: 55 -> n; grad(fn): 55 -> n x 55; grad(grad(fn)): 55 -> n x 55 x 55
-    ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
-    ref_log_likelihoods_sum = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
-    ref_log_likelihood_grads_sum = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
-    ref_log_likelihood_hessians_sum = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
+    if using_lookup:
+        ref_log_likelihoods = log_likelihood(ref_params_flat)  # n
+        # NB: use jacfwd (instead of jacobian/jacrev) when out_dim >> in_dim
+        ref_log_likelihood_grads = jacfwd(log_likelihood)(ref_params_flat)
+        # TODO: resolve memory error for covtype data: data 500,000, params: 55
+        # fn: 55 -> n; grad(fn): 55 -> n x 55; grad(grad(fn)): 55 -> n x 55 x 55
+        ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
+        ref_log_likelihoods_sum = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
+        ref_log_likelihood_grads_sum = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
+        ref_log_likelihood_hessians_sum = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
+    else:
+        ref_log_likelihoods_sum = log_likelihood_sum(ref_params_flat)
+        ref_log_likelihood_grads_sum = jacobian(log_likelihood_sum)(ref_params_flat)
+        ref_log_likelihood_hessians_sum = hessian(log_likelihood_sum)(ref_params_flat)
 
     def estimator(likelihoods, params):
         subsample_log_liks = defaultdict(float)
+        subsample_indices = {}
         for (fn, value, name, subsample_dim, subsample_idx) in likelihoods.values():
             subsample_log_liks[name] += _sum_all_except_at_dim(fn.log_prob(value), subsample_dim)
+            if name not in subsample_indices:
+                subsample_indices[name] = subsample_idx
 
         params_flat, _ = ravel_pytree(params)
         params_diff = params_flat - ref_params_flat
         log_lik_sum = 0.
         # loop over all subsample sites
-        for name, subsample_log_lik in subsample_log_liks.items():
-            n, m = subsample_plate_sizes[name]
+        if using_lookup:
             # NB: in GPU, indexing here is expensive, it is better to compute likelihood, grad, hessian directly
             # m x 55 x 55 (m ~ sqrt(n) ~ 1000)
-            ref_subsample_log_lik = ref_log_likelihoods[name][subsample_idx] + \
-                jnp.dot(ref_log_likelihood_grads[name][subsample_idx], params_diff) + \
-                0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians[name][subsample_idx], params_diff), params_diff)
-            diff = subsample_log_lik - ref_subsample_log_lik
+            ref_subsample_log_lik = {k: v[subsample_indices[k]]
+                                     for k, v in ref_log_likelihoods.items()}
+            ref_subsample_log_lik_grad = {k: v[subsample_indices[k]]
+                                          for k, v in ref_log_likelihood_grads.items()}
+            ref_subsample_log_lik_hessian = {k: v[subsample_indices[k]]
+                                             for k, v in ref_log_likelihood_hessians.items()}
+        else:
+            ref_subsample_log_lik = log_likelihood_sum(ref_params_flat, subsample_indices)
+            ref_subsample_log_lik_grad = jacobian(log_likelihood_sum)(ref_params_flat, subsample_indices)
+            ref_subsample_log_lik_hessian = hessian(log_likelihood_sum)(ref_params_flat, subsample_indices)
+
+        for name, subsample_log_lik in subsample_log_liks.items():
+            n, m = subsample_plate_sizes[name]
+            subsample_idx = subsample_indices[name]
+
+            control_variates = ref_subsample_log_lik[name] + \
+                jnp.dot(ref_subsample_log_lik_grad[name], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(ref_subsample_log_lik_hessian[name], params_diff), params_diff)
+            diff = subsample_log_lik - control_variates
 
             control_variates_sum = ref_log_likelihoods_sum[name] + \
                 jnp.dot(ref_log_likelihood_grads_sum[name], params_diff) + \
                 0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sum[name], params_diff), params_diff)
             unbiased_log_lik = control_variates_sum + n * jnp.mean(diff)
-            variance = n ** 2 / m * jnp.var(diff)
-            log_lik_sum += unbiased_log_lik - 0.5 * variance
+            # variance = n ** 2 / m * jnp.var(diff)
+            log_lik_sum += unbiased_log_lik  # - 0.5 * variance
         return log_lik_sum
 
     return estimator

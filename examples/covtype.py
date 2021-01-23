@@ -30,7 +30,7 @@ def _load_dataset():
     print("Data shape:", features.shape)
     print("Label distribution: {} has label 1, {} has label 0"
           .format(labels.sum(), N - labels.sum()))
-    return features[:100000], labels[:100000]
+    return features, labels
 
 
 def model(data, labels, subsample_size=None):
@@ -70,8 +70,8 @@ def benchmark_hmc(args, features, labels):
             +1.21171586e-01, +2.29205526e-02, +1.47308692e-01, -8.34354162e-02,
             -9.34122875e-02, -2.97472421e-02, -3.03937674e-01, -1.70958012e-01,
             -1.59496680e-01, -1.88516974e-01, -1.20889175e+00])}
-        kernel = HMCECS(NUTS(model, init_strategy=init_to_value(values=ref_params)),
-                        num_blocks=100, reference_params=None)  # ref_params)
+        inner_kernel = NUTS(model, init_strategy=init_to_value(values=ref_params))
+        kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=ref_params, using_lookup=False)
         subsample_size = 1000
     else:
         raise ValueError("Invalid algorithm, either 'HMC', 'NUTS', or 'HMCECS'.")
