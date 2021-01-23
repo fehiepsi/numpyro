@@ -14,6 +14,7 @@ import numpyro
 from numpyro.handlers import condition, seed, substitute, trace
 from numpyro.infer.hmc import HMC
 from numpyro.infer.mcmc import MCMCKernel
+from numpyro.infer.util import _unconstrain_reparam
 from numpyro.util import cond, fori_loop, identity, ravel_pytree
 
 HMCGibbsState = namedtuple("HMCGibbsState", "z, hmc_state, rng_key")
@@ -544,8 +545,10 @@ class control_variate(numpyro.primitives.Messenger):
         self.subsample_plates = {}
 
     def __enter__(self):
-        for handler in numpyro.primitives._PYRO_STACK:
-            if isinstance(handler, substitute) and isinstance(handler.substitute_fn, partial):
+        # trace(substitute(substitute(control_variate(model), unconstrained_reparam)))
+        for handler in numpyro.primitives._PYRO_STACK[::-1]:
+            if isinstance(handler, substitute) and isinstance(handler.substitute_fn, partial) \
+                    and handler.substitute_fn.func is _unconstrain_reparam:
                 self.params = handler.substitute_fn.args[0]
                 break
         return super().__enter__()
@@ -582,13 +585,14 @@ class control_variate(numpyro.primitives.Messenger):
                                            "are not allowed. Please reshape your data.")
                     subsample_idx = self.subsample_plates[frame.name]
                     self.likelihoods[msg["name"]] = (msg["fn"], msg["value"], frame.name, frame.dim, subsample_idx)
-            # mask the current likelihood
-            msg["fn"] = msg["fn"].mask(False)
+                    # mask the current likelihood
+                    msg["fn"] = msg["fn"].mask(False)
         elif msg["type"] == "plate" and msg["args"][0] > msg["args"][1]:
             self.subsample_plates[msg["name"]] = msg["value"]
 
 
 def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, reference_params):
+    # subsample_plate_sizes: name -> (size, subsample_size)
     ref_params_flat, unravel_fn = ravel_pytree(reference_params)
 
     def _sum_all_except_at_dim(x, dim):
@@ -596,8 +600,6 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
         return x.reshape(x.shape[:1] + (-1,)).sum(-1)
 
     def log_likelihood(params_flat):
-        from numpyro.infer.util import _unconstrain_reparam
-
         params = unravel_fn(params_flat)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -615,13 +617,15 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
         return log_lik
 
     # those stats are dict keyed by subsample names
-    ref_log_likelihoods = log_likelihood(ref_params_flat)
+    ref_log_likelihoods = log_likelihood(ref_params_flat)  # n
     # NB: use jacfwd (instead of jacobian/jacrev) when out_dim >> in_dim
     ref_log_likelihood_grads = jacfwd(log_likelihood)(ref_params_flat)
-    ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)
+    # TODO: resolve memory error for covtype data: data 500,000, params: 55
+    # fn: 55 -> n; grad(fn): 55 -> n x 55; grad(grad(fn)): 55 -> n x 55 x 55
+    ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
     ref_log_likelihoods_sum = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
     ref_log_likelihood_grads_sum = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
-    ref_log_likelihood_hessians_sum = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}
+    ref_log_likelihood_hessians_sum = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
 
     def estimator(likelihoods, params):
         subsample_log_liks = defaultdict(float)
@@ -634,6 +638,8 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
         # loop over all subsample sites
         for name, subsample_log_lik in subsample_log_liks.items():
             n, m = subsample_plate_sizes[name]
+            # NB: in GPU, indexing here is expensive, it is better to compute likelihood, grad, hessian directly
+            # m x 55 x 55 (m ~ sqrt(n) ~ 1000)
             ref_subsample_log_lik = ref_log_likelihoods[name][subsample_idx] + \
                 jnp.dot(ref_log_likelihood_grads[name][subsample_idx], params_diff) + \
                 0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians[name][subsample_idx], params_diff), params_diff)

@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.examples.datasets import COVTYPE, load_dataset
-from numpyro.infer import HMC, HMCECS, MCMC, NUTS
+from numpyro.infer import HMC, HMCECS, MCMC, NUTS, init_to_value
 
 
 def _load_dataset():
@@ -70,7 +70,8 @@ def benchmark_hmc(args, features, labels):
             +1.21171586e-01, +2.29205526e-02, +1.47308692e-01, -8.34354162e-02,
             -9.34122875e-02, -2.97472421e-02, -3.03937674e-01, -1.70958012e-01,
             -1.59496680e-01, -1.88516974e-01, -1.20889175e+00])}
-        kernel = HMCECS(NUTS(model), num_blocks=100, reference_params=ref_params)
+        kernel = HMCECS(NUTS(model, init_strategy=init_to_value(values=ref_params)),
+                        num_blocks=100, reference_params=None)  # ref_params)
         subsample_size = 1000
     else:
         raise ValueError("Invalid algorithm, either 'HMC', 'NUTS', or 'HMCECS'.")
