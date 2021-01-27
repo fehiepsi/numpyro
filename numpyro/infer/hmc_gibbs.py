@@ -6,7 +6,7 @@ import copy
 from functools import partial
 import warnings
 
-from jax import device_put, jacfwd, jacobian, grad, hessian, ops, random, value_and_grad
+from jax import device_put, grad, hessian, jacfwd, jacobian, ops, random, value_and_grad
 import jax.numpy as jnp
 from jax.scipy.special import expit
 

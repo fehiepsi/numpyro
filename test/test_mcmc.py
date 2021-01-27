@@ -484,7 +484,7 @@ def test_extra_fields():
 
 @pytest.mark.parametrize('algo', ['HMC', 'NUTS'])
 def test_functional_beta_bernoulli_x64(algo):
-    warmup_steps, num_samples = 500, 20000
+    warmup_steps, num_samples = 410, 100
 
     def model(data):
         alpha = jnp.array([1.1, 1.1])
@@ -681,3 +681,14 @@ def test_forward_mode_differentiation():
     # this fails in reverse mode
     mcmc = MCMC(NUTS(model, forward_mode_differentiation=True), 10, 10)
     mcmc.run(random.PRNGKey(0))
+
+
+def test_model_with_lift_handler():
+    def model(data):
+        c = numpyro.param("c", jnp.array(1.), constraint=dist.constraints.positive)
+        x = numpyro.sample("x", dist.LogNormal(c, 1.), obs=data)
+        return x
+
+    nuts_kernel = NUTS(numpyro.handlers.lift(model, prior={"c": dist.Gamma(0.01, 0.01)}))
+    mcmc = MCMC(nuts_kernel, num_warmup=10, num_samples=10)
+    mcmc.run(random.PRNGKey(1), jnp.exp(random.normal(random.PRNGKey(0), (1000,))))

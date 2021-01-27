@@ -4,13 +4,17 @@
 import argparse
 import time
 
+import matplotlib.pyplot as plt
+
 from jax import random
 import jax.numpy as jnp
 
 import numpyro
 import numpyro.distributions as dist
 from numpyro.examples.datasets import COVTYPE, load_dataset
-from numpyro.infer import HMC, HMCECS, MCMC, NUTS, init_to_value
+from numpyro.infer import HMC, HMCECS, MCMC, NUTS, SVI, Trace_ELBO, init_to_value
+from numpyro.infer.autoguide import AutoBNAFNormal
+from numpyro.infer.reparam import NeuTraReparam
 
 
 def _load_dataset():
@@ -47,10 +51,11 @@ def benchmark_hmc(args, features, labels):
     if args.algo == "HMC":
         step_size = jnp.sqrt(0.5 / features.shape[0])
         trajectory_length = step_size * args.num_steps
-        kernel = HMC(model, step_size=step_size, trajectory_length=trajectory_length, adapt_step_size=False)
+        kernel = HMC(model, step_size=step_size, trajectory_length=trajectory_length, adapt_step_size=False,
+                     dense_mass=args.dense_mass)
         subsample_size = None
     elif args.algo == "NUTS":
-        kernel = NUTS(model)
+        kernel = NUTS(model, dense_mass=args.dense_mass)
         subsample_size = None
     elif args.algo == "HMCECS":
         # a MAP estimate at the following source
@@ -70,14 +75,28 @@ def benchmark_hmc(args, features, labels):
             +1.21171586e-01, +2.29205526e-02, +1.47308692e-01, -8.34354162e-02,
             -9.34122875e-02, -2.97472421e-02, -3.03937674e-01, -1.70958012e-01,
             -1.59496680e-01, -1.88516974e-01, -1.20889175e+00])}
-        inner_kernel = NUTS(model, init_strategy=init_to_value(values=ref_params))
-        kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=ref_params, using_lookup=False)
         subsample_size = 1000
+        inner_kernel = NUTS(model, init_strategy=init_to_value(values=ref_params),
+                            dense_mass=args.dense_mass)
+        kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=ref_params, using_lookup=False)
+    elif args.algo == "FlowHMCECS":
+        subsample_size = 1000
+        guide = AutoBNAFNormal(model, num_flows=1, hidden_factors=[8])
+        svi = SVI(model, guide, numpyro.optim.Adam(0.001), Trace_ELBO())
+        params, losses = svi.run(random.PRNGKey(2), 10000, features, labels)
+        plt.plot(losses)
+
+        neutra = NeuTraReparam(guide, params)
+        neutra_model = neutra.reparam(model)
+        neutra_ref_params = {"auto_shared_latent": jnp.zeros(55)}
+        inner_kernel = NUTS(neutra_model, init_strategy=init_to_value(values=neutra_ref_params),
+                            dense_mass=args.dense_mass)
+        kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=neutra_ref_params, using_lookup=False)
     else:
         raise ValueError("Invalid algorithm, either 'HMC', 'NUTS', or 'HMCECS'.")
     mcmc = MCMC(kernel, args.num_warmup, args.num_samples)
     mcmc.run(rng_key, features, labels, subsample_size)
-    mcmc.print_summary()
+    mcmc.print_summary(exclude_deterministic=False)
     print('\nMCMC elapsed time:', time.time() - start)
 
 
@@ -87,17 +106,22 @@ def main(args):
 
 
 if __name__ == '__main__':
-    assert numpyro.__version__.startswith('0.4.1')
+    assert numpyro.__version__.startswith('0.5.0')
     parser = argparse.ArgumentParser(description="parse args")
-    parser.add_argument('-n', '--num-samples', default=10000, type=int, help='number of samples')
-    parser.add_argument('--num-warmup', default=10000, type=int, help='number of warmup steps')
+    parser.add_argument('-n', '--num-samples', default=1000, type=int, help='number of samples')
+    parser.add_argument('--num-warmup', default=1000, type=int, help='number of warmup steps')
     parser.add_argument('--num-steps', default=10, type=int, help='number of steps (for "HMC")')
     parser.add_argument('--num-chains', nargs='?', default=1, type=int)
-    parser.add_argument('--algo', default='HMCECS', type=str, help='whether to run "HMC", "NUTS", or "HMCECS"')
+    parser.add_argument('--algo', default='HMCECS', type=str,
+                        help='whether to run "HMC", "NUTS", "HMCECS", or "FlowHMCECS"')
+    parser.add_argument('--dense-mass', action="store_true")
+    parser.add_argument('--x64', action="store_true")
     parser.add_argument('--device', default='cpu', type=str, help='use "cpu" or "gpu".')
     args = parser.parse_args()
 
     numpyro.set_platform(args.device)
     numpyro.set_host_device_count(args.num_chains)
+    if args.x64:
+        numpyro.enable_x64()
 
     main(args)
