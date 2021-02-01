@@ -34,7 +34,7 @@ def _load_dataset():
     print("Data shape:", features.shape)
     print("Label distribution: {} has label 1, {} has label 0"
           .format(labels.sum(), N - labels.sum()))
-    return features, labels
+    return features[::20], labels[::20]
 
 
 def model(data, labels, subsample_size=None):
@@ -78,7 +78,8 @@ def benchmark_hmc(args, features, labels):
         subsample_size = 1000
         inner_kernel = NUTS(model, init_strategy=init_to_value(values=ref_params),
                             dense_mass=args.dense_mass)
-        kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=ref_params, using_lookup=False)
+        kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=ref_params,
+                        using_lookup=False, no_variance=True)
     elif args.algo == "FlowHMCECS":
         subsample_size = 1000
         guide = AutoBNAFNormal(model, num_flows=1, hidden_factors=[8])
@@ -95,7 +96,11 @@ def benchmark_hmc(args, features, labels):
     else:
         raise ValueError("Invalid algorithm, either 'HMC', 'NUTS', or 'HMCECS'.")
     mcmc = MCMC(kernel, args.num_warmup, args.num_samples)
-    mcmc.run(rng_key, features, labels, subsample_size)
+    from numpyro.util import control_flow_prims_disabled
+    from jax import disable_jit
+    # with disable_jit(), control_flow_prims_disabled():
+    mcmc.run(rng_key, features, labels, subsample_size, extra_fields=("accept_prob",))
+    print("Mean accept prob:", jnp.mean(mcmc.get_extra_fields()["accept_prob"]))
     mcmc.print_summary(exclude_deterministic=False)
     print('\nMCMC elapsed time:', time.time() - start)
 

@@ -6,7 +6,7 @@ import copy
 from functools import partial
 import warnings
 
-from jax import device_put, grad, hessian, jacfwd, jacobian, ops, random, value_and_grad
+from jax import device_put, grad, hessian, jacfwd, jacrev, jacobian, lax, ops, random, value_and_grad
 import jax.numpy as jnp
 from jax.scipy.special import expit
 
@@ -400,31 +400,38 @@ class DiscreteHMCGibbs(HMCGibbs):
         return HMCGibbsState(z, hmc_state, rng_key)
 
 
-def _subsample_gibbs_fn(potential_fn, plate_sizes, num_blocks=1):
+HMCECSState = namedtuple("HMCECSState", "z, hmc_state, rng_key, gibbs_state, accept_prob")
+DiffEstState = namedtuple("DiffEstState", "ref_subsample_log_liks, "
+                          "ref_subsample_log_lik_grads, ref_subsample_log_lik_hessians")
+BlockPoissonEstState = namedtuple("BlockPoissonEstState", "block_rng_keys, sign")
 
-    def gibbs_fn(rng_key, gibbs_sites, hmc_sites, pe):
-        assert set(gibbs_sites) == set(plate_sizes)
-        u_new = {}
-        for name in gibbs_sites:
-            size, subsample_size = plate_sizes[name]
-            rng_key, subkey, block_key = random.split(rng_key, 3)
-            block_size = subsample_size // num_blocks
 
-            chosen_block = random.randint(block_key, shape=(), minval=0, maxval=num_blocks)
-            new_idx = random.randint(subkey, minval=0, maxval=size, shape=(subsample_size,))
-            block_mask = jnp.arange(subsample_size) // block_size == chosen_block
+def _wrap_gibbs_state(model):
+    def wrapped_fn(*args, **kwargs):
+        msg = {"type": "_gibbs_state", "value": kwargs.pop("_gibbs_state", ())}
+        numpyro.primitives.apply_stack(msg)
+        return model(*args, **kwargs)
 
-            u_new[name] = jnp.where(block_mask, new_idx, gibbs_sites[name])
+    return wrapped_fn
 
-        # given a fixed hmc_sites, pe_new - pe_curr = loglik_new - loglik_curr
-        pe_new = potential_fn(u_new, hmc_sites)
-        accept_prob = jnp.clip(jnp.exp(pe - pe_new), a_max=1.0)
-        gibbs_sites, pe = cond(random.bernoulli(rng_key, accept_prob),
-                               (u_new, pe_new), identity,
-                               (gibbs_sites, pe), identity)
-        return gibbs_sites, pe
 
-    return gibbs_fn
+def _block_update(plate_sizes, num_blocks, rng_key, gibbs_sites, gibbs_state):
+    u_new = {}
+    for name, subsample_idx in gibbs_sites.items():
+        size, subsample_size = plate_sizes[name]
+        rng_key, subkey, block_key = random.split(rng_key, 3)
+        block_size = (subsample_size - 1) // num_blocks + 1
+        pad = block_size - (subsample_size - 1) % block_size - 1
+
+        chosen_block = random.randint(block_key, shape=(), minval=0, maxval=num_blocks)
+        new_idx = random.randint(subkey, minval=0, maxval=size, shape=(num_blocks,))
+        subsample_idx_padded = jnp.pad(subsample_idx, (0, pad))
+        start = chosen_block * block_size
+        subsample_idx_padded = lax.dynamic_update_slice_in_dim(
+            subsample_idx_padded, new_idx, start, 0)
+
+        u_new[name] = subsample_idx_padded[:subsample_size]
+    return u_new, gibbs_state
 
 
 class HMCECS(HMCGibbs):
@@ -479,17 +486,30 @@ class HMCECS(HMCGibbs):
         >>> assert abs(jnp.mean(samples) - 1.) < 0.1
 
     """
-    def __init__(self, inner_kernel, *, num_blocks=1, reference_params=None, using_lookup=False):
+    def __init__(self, inner_kernel, *, num_blocks=1, reference_params=None, using_lookup=False, no_variance=False):
         super().__init__(inner_kernel, lambda *args: None, None)
+        self.inner_kernel._model = _wrap_gibbs_state(self.inner_kernel._model)
         self._num_blocks = num_blocks
         # TODO: for users, it might be better to expose reference_values (constrained space)
         self._reference_params = reference_params
         self._using_lookup = using_lookup
+        self._no_variance = no_variance
+
+    def postprocess_fn(self, args, kwargs):
+        def fn(z):
+            model_kwargs = {} if kwargs is None else kwargs.copy()
+            hmc_sites = {k: v for k, v in z.items() if k not in self._gibbs_sites}
+            gibbs_sites = {k: v for k, v in z.items() if k in self._gibbs_sites}
+            model_kwargs["_gibbs_sites"] = gibbs_sites
+            hmc_sites = self.inner_kernel.postprocess_fn(args, model_kwargs)(hmc_sites)
+            return hmc_sites
+
+        return fn
 
     def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
         model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
-        rng_key, key_u = random.split(rng_key)
-        self._prototype_trace = trace(seed(self.model, key_u)).get_trace(*model_args, **model_kwargs)
+        rng_key, rng_u = random.split(rng_key)
+        self._prototype_trace = trace(seed(self.model, rng_u)).get_trace(*model_args, **model_kwargs)
         self._subsample_plate_sizes = {
             name: site["args"]
             for name, site in self._prototype_trace.items()
@@ -497,69 +517,70 @@ class HMCECS(HMCGibbs):
         }
         self._gibbs_sites = list(self._subsample_plate_sizes.keys())
         if self._reference_params is not None:
-            estimator = taylor_estimator(self.model, model_args, model_kwargs,
-                                         self._subsample_plate_sizes, self._reference_params, self._using_lookup)
-            self.inner_kernel._model = control_variate(self.inner_kernel._model, estimator)
-        return super().init(rng_key, num_warmup, init_params, model_args, model_kwargs)
+            estimator, gibbs_init, self._gibbs_update = taylor_estimator(
+                self.inner_kernel._model, model_args, model_kwargs, self._subsample_plate_sizes,
+                self._reference_params, self._num_blocks, self._using_lookup, self._no_variance)
+            self.inner_kernel._model = estimate_likelihood(self.inner_kernel._model, estimator)
+            z_gibbs = {name: site["value"] for name, site in self._prototype_trace.items()
+                       if name in self._gibbs_sites}
+            rng_key, rng_state = random.split(rng_key)
+            gibbs_state = gibbs_init(rng_state, z_gibbs)
+        else:
+            self._gibbs_update = partial(_block_update, self._subsample_plate_sizes, self._num_blocks)
+            gibbs_state = ()
+
+        model_kwargs["_gibbs_state"] = gibbs_state
+        state = super().init(rng_key, num_warmup, init_params, model_args, model_kwargs)
+        return HMCECSState(state.z, state.hmc_state, state.rng_key, gibbs_state, jnp.array(0.))
 
     def sample(self, state, model_args, model_kwargs):
-        model_kwargs = {} if model_kwargs is None else model_kwargs
+        model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
         rng_key, rng_gibbs = random.split(state.rng_key)
 
-        def potential_fn(z_gibbs, z_hmc):
+        def potential_fn(z_gibbs, gibbs_state, z_hmc):
             return self.inner_kernel._potential_fn_gen(
-                *model_args, _gibbs_sites=z_gibbs, **model_kwargs)(z_hmc)
+                *model_args, _gibbs_sites=z_gibbs, _gibbs_state=gibbs_state, **model_kwargs)(z_hmc)
 
         z_gibbs = {k: v for k, v in state.z.items() if k not in state.hmc_state.z}
-        z_hmc = {k: v for k, v in state.z.items() if k in state.hmc_state.z}
-        model_kwargs_ = model_kwargs.copy()
-        model_kwargs_["_gibbs_sites"] = z_gibbs
+        z_gibbs_new, gibbs_state_new = self._gibbs_update(rng_key, z_gibbs, state.gibbs_state)
 
-        gibbs_fn = _subsample_gibbs_fn(potential_fn, self._subsample_plate_sizes, self._num_blocks)
-        z_gibbs, pe = gibbs_fn(rng_key=rng_gibbs, gibbs_sites=z_gibbs, hmc_sites=z_hmc,
-                               pe=state.hmc_state.potential_energy)
+        # given a fixed hmc_sites, pe_new - pe_curr = loglik_new - loglik_curr
+        pe = state.hmc_state.potential_energy
+        pe_new = potential_fn(z_gibbs_new, gibbs_state_new, state.hmc_state.z)
+        accept_prob = jnp.clip(jnp.exp(pe - pe_new), a_max=1.0)
+        print(pe, pe_new, accept_prob)
+        z_gibbs, gibbs_state, pe = cond(random.bernoulli(rng_key, accept_prob),
+                                        (z_gibbs_new, gibbs_state_new, pe_new), identity,
+                                        (z_gibbs, state.gibbs_state, pe), identity)
 
+        # TODO: move this to the above cond, only compute grad when accepting
         if self.inner_kernel._forward_mode_differentiation:
-            z_grad = jacfwd(partial(potential_fn, z_gibbs))(state.hmc_state.z)
+            z_grad = jacfwd(partial(potential_fn, z_gibbs, gibbs_state))(state.hmc_state.z)
         else:
-            z_grad = grad(partial(potential_fn, z_gibbs))(state.hmc_state.z)
+            z_grad = grad(partial(potential_fn, z_gibbs, gibbs_state))(state.hmc_state.z)
         hmc_state = state.hmc_state._replace(z_grad=z_grad, potential_energy=pe)
 
-        model_kwargs_["_gibbs_sites"] = z_gibbs
-        hmc_state = self.inner_kernel.sample(hmc_state, model_args, model_kwargs_)
+        model_kwargs["_gibbs_sites"] = z_gibbs
+        model_kwargs["_gibbs_state"] = gibbs_state
+        hmc_state = self.inner_kernel.sample(hmc_state, model_args, model_kwargs)
 
+        # TODO: post update gibbs_state to update sign in Block Poisson estimator
         z = {**z_gibbs, **hmc_state.z}
-
-        return HMCGibbsState(z, hmc_state, rng_key)
-
-
-def _wrap_block_poisson(model):
-    def wrapped_fn(*args, **kwargs):
-        seeds = kwargs.pop("_subsample_seeds", {})
-        if seeds:
-            msg = {"type": "_subsample_seed", "value": kwargs.pop("_subsample_seeds", {})}
-            if "_gibbs_sites" in kwargs:
-                for name in seeds:
-                    # set subsample indices to be empty
-                    kwargs["_gibbs_sites"][name] = jnp.array([])
-            numpyro.primitives.apply_stack(msg)
-        return model(*args, **kwargs)
-
-    return wrapped_fn
+        return HMCECSState(z, hmc_state, rng_key, gibbs_state, accept_prob)
 
 
-class control_variate(numpyro.primitives.Messenger):
+class estimate_likelihood(numpyro.primitives.Messenger):
     def __init__(self, fn=None, estimator=None):
-        # estimator: accept likelihood tuple (fn, value, subsample_name, subsample_dim, subsample_idx)
+        # estimator: accept likelihood tuple (fn, value, subsample_name, subsample_dim)
         # and current unconstrained params
         # and returns log of the bias-corrected likelihood
         assert estimator is not None
-        super().__init__(_wrap_block_poisson(fn))
+        super().__init__(fn)
         self.estimator = estimator
         self.params = None
         self.likelihoods = {}
         self.subsample_plates = {}
-        self._subsample_seeds = {}
+        self.gibbs_state = None
 
     def __enter__(self):
         # trace(substitute(substitute(control_variate(model), unconstrained_reparam)))
@@ -582,20 +603,20 @@ class control_variate(numpyro.primitives.Messenger):
         # add numpyro.factor; ideally, we will want to skip this computation when making prediction
         # see: https://github.com/pyro-ppl/pyro/issues/2744
         numpyro.factor("_biased_corrected_log_likelihood",
-                       self.estimator(self.likelihoods, self.params, self._subsample_seeds))
+                       self.estimator(self.likelihoods, self.params, self.gibbs_state))
 
         # clean up
         self.params = None
         self.likelihoods = {}
         self.subsample_plates = {}
-        self._block_poisson_seeds = {}
+        self.gibbs_state = None
 
     def process_message(self, msg):
         if self.params is None:
             return
 
-        if msg["type"] == "_block_poisson":
-            self._block_poisson_seeds = msg["value"]
+        if msg["type"] == "_gibbs_state":
+            self.gibbs_state = msg["value"]
             return
 
         if msg["type"] == "sample" and msg["is_observed"]:
@@ -606,17 +627,18 @@ class control_variate(numpyro.primitives.Messenger):
                     if msg["name"] in self.likelihoods:
                         raise RuntimeError(f"Multiple subsample plates at site {msg['name']} "
                                            "are not allowed. Please reshape your data.")
-                    subsample_idx = self.subsample_plates[frame.name]
-                    if len(subsample_idx) == 0:
-                        subsample_idx = self._subsample_seeds[frame.name]
-                    self.likelihoods[msg["name"]] = (msg["fn"], msg["value"], frame.name, frame.dim, subsample_idx)
+                    self.likelihoods[msg["name"]] = (msg["fn"], msg["value"], frame.name, frame.dim)
                     # mask the current likelihood
                     msg["fn"] = msg["fn"].mask(False)
         elif msg["type"] == "plate" and msg["args"][0] > msg["args"][1]:
             self.subsample_plates[msg["name"]] = msg["value"]
 
 
-def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, reference_params, using_lookup=False):
+def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, reference_params,
+                     num_blocks=1, using_lookup=False, no_variance=False):
+    if no_variance:
+        return taylor_estimator_no_variance(model, model_args, model_kwargs, subsample_plate_sizes,
+                                            reference_params, num_blocks, using_lookup)
     # subsample_plate_sizes: name -> (size, subsample_size)
     ref_params_flat, unravel_fn = ravel_pytree(reference_params)
 
@@ -634,13 +656,17 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
                     substitute(substitute_fn=partial(_unconstrain_reparam, params)):
                 model(*model_args, **model_kwargs)
 
-        log_lik = defaultdict(float)
+        log_lik = {}
         for site in tr.values():
             if site["type"] == "sample" and site["is_observed"]:
                 for frame in site["cond_indep_stack"]:
                     if frame.name in subsample_plate_sizes:
-                        log_lik[frame.name] += _sum_all_except_at_dim(
-                            site["fn"].log_prob(site["value"]), frame.dim)
+                        if frame.name in log_lik:
+                            log_lik[frame.name] += _sum_all_except_at_dim(
+                                site["fn"].log_prob(site["value"]), frame.dim)
+                        else:
+                            log_lik[frame.name] = _sum_all_except_at_dim(
+                                site["fn"].log_prob(site["value"]), frame.dim)
         return log_lik
 
     def log_likelihood_sum(params_flat, subsample_indices=None):
@@ -654,63 +680,120 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
         # TODO: resolve memory error for covtype data: data 500,000, params: 55
         # fn: 55 -> n; grad(fn): 55 -> n x 55; grad(grad(fn)): 55 -> n x 55 x 55
         ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
-        ref_log_likelihoods_sum = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
-        ref_log_likelihood_grads_sum = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
-        ref_log_likelihood_hessians_sum = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
+        ref_log_likelihoods_sums = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
+        ref_log_likelihood_grads_sums = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
+        ref_log_likelihood_hessians_sums = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
     else:
-        ref_log_likelihoods_sum = log_likelihood_sum(ref_params_flat)
-        ref_log_likelihood_grads_sum = jacobian(log_likelihood_sum)(ref_params_flat)
-        ref_log_likelihood_hessians_sum = hessian(log_likelihood_sum)(ref_params_flat)
+        ref_log_likelihoods_sums = log_likelihood_sum(ref_params_flat)
+        ref_log_likelihood_grads_sums = jacobian(log_likelihood_sum)(ref_params_flat)
+        ref_log_likelihood_hessians_sums = hessian(log_likelihood_sum)(ref_params_flat)
 
-    def estimator(likelihoods, params):
+    def gibbs_init(rng_key, gibbs_sites):
+        if using_lookup:
+            ref_subsample_log_liks = {k: ref_log_likelihoods[k][v] for k, v in gibbs_sites.items()}
+            ref_subsample_log_lik_grads = {k: ref_log_likelihood_grads[k][v] for k, v in gibbs_sites.items()}
+            ref_subsample_log_lik_hessians = {k: ref_log_likelihood_hessians[k][v]
+                                              for k, v in gibbs_sites.items()}
+        else:
+            ref_subsample_log_liks = log_likelihood(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_grads = jacfwd(log_likelihood)(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat, gibbs_sites)
+        return DiffEstState(ref_subsample_log_liks, ref_subsample_log_lik_grads, ref_subsample_log_lik_hessians)
+
+    def gibbs_update(rng_key, gibbs_sites, gibbs_state):
+        u_new = {}
+        pads = {}
+        new_idxs = {}
+        starts = {}
+        new_states = defaultdict(dict)
+        for name, subsample_idx in gibbs_sites.items():
+            size, subsample_size = subsample_plate_sizes[name]
+            rng_key, subkey, block_key = random.split(rng_key, 3)
+            block_size = (subsample_size - 1) // num_blocks + 1
+            pad = block_size - (subsample_size - 1) % block_size - 1
+
+            chosen_block = random.randint(block_key, shape=(), minval=0, maxval=num_blocks)
+            new_idx = random.randint(subkey, minval=0, maxval=size, shape=(block_size,))
+            subsample_idx_padded = jnp.pad(subsample_idx, (0, pad))
+            start = chosen_block * block_size
+            subsample_idx_padded = lax.dynamic_update_slice_in_dim(
+                subsample_idx_padded, new_idx, start, 0)
+
+            u_new[name] = subsample_idx_padded[:subsample_size]
+            pads[name] = pad
+            new_idxs[name] = new_idx
+            starts[name] = start
+
+        # NB: in GPU, indexing here is expensive, it is better to compute likelihood, grad, hessian directly
+        # m x 55 x 55 (m ~ sqrt(n) ~ 1000)
+        if using_lookup:
+            for stat, all_values, last_values in zip(
+                    ["log_liks", "grads", "hessians"],
+                    [ref_log_likelihoods,
+                     ref_log_likelihood_grads,
+                     ref_log_likelihood_hessians],
+                    [gibbs_state.ref_subsample_log_liks,
+                     gibbs_state.ref_subsample_log_lik_grads,
+                     gibbs_state.ref_subsample_log_lik_hessians]):
+                for name, subsample_idx in gibbs_sites.items():
+                    size, subsample_size = subsample_plate_sizes[name]
+                    pad, new_idx, start = pads[name], new_idxs[name], starts[name]
+                    new_value = jnp.pad(last_values[name],
+                                        [(0, pad)] + [(0, 0)] * (jnp.ndim(last_values[name]) - 1))
+                    new_value = lax.dynamic_update_slice_in_dim(
+                        new_value, all_values[name][new_idx], start, 0)
+                    new_states[stat][name] = new_value[:subsample_size]
+        else:
+            ref_subsample_log_liks = log_likelihood(ref_params_flat, new_idxs)
+            ref_subsample_log_lik_grads = jacfwd(log_likelihood)(ref_params_flat, new_idxs)
+            ref_subsample_log_lik_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat, new_idxs)
+            for stat, new_block_values, last_values in zip(
+                    ["log_liks", "grads", "hessians"],
+                    [ref_subsample_log_liks,
+                     ref_subsample_log_lik_grads,
+                     ref_subsample_log_lik_hessians],
+                    [gibbs_state.ref_subsample_log_liks,
+                     gibbs_state.ref_subsample_log_lik_grads,
+                     gibbs_state.ref_subsample_log_lik_hessians]):
+                for name, subsample_idx in gibbs_sites.items():
+                    size, subsample_size = subsample_plate_sizes[name]
+                    pad, new_idx, start = pads[name], new_idxs[name], starts[name]
+                    new_value = jnp.pad(last_values[name], [(0, pad)] + [(0, 0)] * (jnp.ndim(last_values[name]) - 1))
+                    new_value = lax.dynamic_update_slice_in_dim(
+                        new_value, new_block_values[name], start, 0)
+                    new_states[stat][name] = new_value[:subsample_size]
+        gibbs_state = DiffEstState(new_states["log_liks"], new_states["grads"], new_states["hessians"])
+        return u_new, gibbs_state
+
+    def estimator(likelihoods, params, gibbs_state):
         subsample_log_liks = defaultdict(float)
-        subsample_indices = {}
-        for (fn, value, name, subsample_dim, subsample_idx) in likelihoods.values():
+        for (fn, value, name, subsample_dim) in likelihoods.values():
             subsample_log_liks[name] += _sum_all_except_at_dim(fn.log_prob(value), subsample_dim)
-            if name not in subsample_indices:
-                subsample_indices[name] = subsample_idx
 
         params_flat, _ = ravel_pytree(params)
         params_diff = params_flat - ref_params_flat
         log_lik_sum = 0.
-        # loop over all subsample sites
-        if using_lookup:
-            # NB: in GPU, indexing here is expensive, it is better to compute likelihood, grad, hessian directly
-            # m x 55 x 55 (m ~ sqrt(n) ~ 1000)
-            ref_subsample_log_lik = {k: v[subsample_indices[k]]
-                                     for k, v in ref_log_likelihoods.items()}
-            ref_subsample_log_lik_grad = {k: v[subsample_indices[k]]
-                                          for k, v in ref_log_likelihood_grads.items()}
-            ref_subsample_log_lik_hessian = {k: v[subsample_indices[k]]
-                                             for k, v in ref_log_likelihood_hessians.items()}
-        else:
-            ref_subsample_log_lik = log_likelihood_sum(ref_params_flat, subsample_indices)
-            ref_subsample_log_lik_grad = jacobian(log_likelihood_sum)(ref_params_flat, subsample_indices)
-            ref_subsample_log_lik_hessian = hessian(log_likelihood_sum)(ref_params_flat, subsample_indices)
-
         for name, subsample_log_lik in subsample_log_liks.items():
             n, m = subsample_plate_sizes[name]
-            subsample_idx = subsample_indices[name]
 
-            control_variates = ref_subsample_log_lik[name] + \
-                jnp.dot(ref_subsample_log_lik_grad[name], params_diff) + \
-                0.5 * jnp.dot(jnp.dot(ref_subsample_log_lik_hessian[name], params_diff), params_diff)
+            control_variates = gibbs_state.ref_subsample_log_liks[name] + \
+                jnp.dot(gibbs_state.ref_subsample_log_lik_grads[name], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(gibbs_state.ref_subsample_log_lik_hessians[name], params_diff), params_diff)
             diff = subsample_log_lik - control_variates
 
-            control_variates_sum = ref_log_likelihoods_sum[name] + \
-                jnp.dot(ref_log_likelihood_grads_sum[name], params_diff) + \
-                0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sum[name], params_diff), params_diff)
+            control_variates_sum = ref_log_likelihoods_sums[name] + \
+                jnp.dot(ref_log_likelihood_grads_sums[name], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sums[name], params_diff), params_diff)
             unbiased_log_lik = control_variates_sum + n * jnp.mean(diff)
             variance = n ** 2 / m * jnp.var(diff)
             log_lik_sum += unbiased_log_lik - 0.5 * variance
         return log_lik_sum
 
-    return estimator
+    return estimator, gibbs_init, gibbs_update
 
 
-def poisson_estimator(model, model_args, model_kwargs, subsample_plate_sizes, reference_params,
-                      minibatch_size=30, num_blocks=100, using_lookup=False):
-    lower_bound = minibatch_size - num_blocks
+def taylor_estimator_no_variance(model, model_args, model_kwargs, subsample_plate_sizes, reference_params,
+                                 num_blocks=1, using_lookup=False):
     # subsample_plate_sizes: name -> (size, subsample_size)
     ref_params_flat, unravel_fn = ravel_pytree(reference_params)
 
@@ -728,13 +811,17 @@ def poisson_estimator(model, model_args, model_kwargs, subsample_plate_sizes, re
                     substitute(substitute_fn=partial(_unconstrain_reparam, params)):
                 model(*model_args, **model_kwargs)
 
-        log_lik = defaultdict(float)
+        log_lik = {}
         for site in tr.values():
             if site["type"] == "sample" and site["is_observed"]:
                 for frame in site["cond_indep_stack"]:
                     if frame.name in subsample_plate_sizes:
-                        log_lik[frame.name] += _sum_all_except_at_dim(
-                            site["fn"].log_prob(site["value"]), frame.dim)
+                        if frame.name in log_lik:
+                            log_lik[frame.name] += _sum_all_except_at_dim(
+                                site["fn"].log_prob(site["value"]), frame.dim)
+                        else:
+                            log_lik[frame.name] = _sum_all_except_at_dim(
+                                site["fn"].log_prob(site["value"]), frame.dim)
         return log_lik
 
     def log_likelihood_sum(params_flat, subsample_indices=None):
@@ -748,58 +835,251 @@ def poisson_estimator(model, model_args, model_kwargs, subsample_plate_sizes, re
         # TODO: resolve memory error for covtype data: data 500,000, params: 55
         # fn: 55 -> n; grad(fn): 55 -> n x 55; grad(grad(fn)): 55 -> n x 55 x 55
         ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
-        ref_log_likelihoods_sum = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
-        ref_log_likelihood_grads_sum = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
-        ref_log_likelihood_hessians_sum = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
+        ref_log_likelihoods_sums = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
+        ref_log_likelihood_grads_sums = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
+        ref_log_likelihood_hessians_sums = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
     else:
-        ref_log_likelihoods_sum = log_likelihood_sum(ref_params_flat)
-        ref_log_likelihood_grads_sum = jacobian(log_likelihood_sum)(ref_params_flat)
-        ref_log_likelihood_hessians_sum = hessian(log_likelihood_sum)(ref_params_flat)
+        ref_log_likelihoods_sums = log_likelihood_sum(ref_params_flat)
+        ref_log_likelihood_grads_sums = jacobian(log_likelihood_sum)(ref_params_flat)
+        ref_log_likelihood_hessians_sums = hessian(log_likelihood_sum)(ref_params_flat)
 
-    def estimator(likelihoods, params, poisson_rngs):
+    def gibbs_init(rng_key, gibbs_sites):
+        if using_lookup:
+            ref_subsample_log_liks = {k: ref_log_likelihoods[k][v].sum(0) for k, v in gibbs_sites.items()}
+            ref_subsample_log_lik_grads = {k: ref_log_likelihood_grads[k][v].sum(0) for k, v in gibbs_sites.items()}
+            ref_subsample_log_lik_hessians = {k: ref_log_likelihood_hessians[k][v].sum(0)
+                                              for k, v in gibbs_sites.items()}
+        else:
+            ref_subsample_log_liks = log_likelihood_sum(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_grads = jacobian(log_likelihood_sum)(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_hessians = hessian(log_likelihood_sum)(ref_params_flat, gibbs_sites)
+        return DiffEstState(ref_subsample_log_liks, ref_subsample_log_lik_grads, ref_subsample_log_lik_hessians)
+
+    def gibbs_update(rng_key, gibbs_sites, gibbs_state):
+        u_new = {}
+        new_idxs = {}
+        old_idxs = {}
+        for name, subsample_idx in gibbs_sites.items():
+            size, subsample_size = subsample_plate_sizes[name]
+            rng_key, subkey, block_key = random.split(rng_key, 3)
+            block_size = (subsample_size - 1) // num_blocks + 1
+            pad = block_size - (subsample_size - 1) % block_size - 1
+
+            chosen_block = random.randint(block_key, shape=(), minval=0, maxval=num_blocks)
+            new_idx = random.randint(subkey, minval=0, maxval=size, shape=(block_size,))
+            new_idx = jnp.where((chosen_block == num_blocks - 1) & jnp.arange(block_size) >= (block_size - pad),
+                                0, new_idx)
+            subsample_idx_padded = jnp.pad(subsample_idx, (0, pad))
+            start = chosen_block * block_size
+            old_idx = lax.dynamic_slice_in_dim(
+                subsample_idx_padded, start, block_size, 0)
+            subsample_idx_padded = lax.dynamic_update_slice_in_dim(
+                subsample_idx_padded, new_idx, start, 0)
+
+            u_new[name] = subsample_idx_padded[:subsample_size]
+            new_idxs[name] = new_idx
+            old_idxs[name] = old_idx
+
+        # NB: in GPU, indexing here is expensive, it is better to compute likelihood, grad, hessian directly
+        # m x 55 x 55 (m ~ sqrt(n) ~ 1000)
+        # NB: this costs O(block_size) per 1 MCMC step
+        if using_lookup:
+            block_values_new = {k: ref_log_likelihoods[k][v].sum(0) for k, v in new_idxs.items()}
+            block_grads_new = {k: ref_log_likelihood_grads[k][v].sum(0) for k, v in new_idxs.items()}
+            block_hessians_new = {k: ref_log_likelihood_hessians[k][v].sum(0) for k, v in new_idxs.items()}
+            block_values_old = {k: ref_log_likelihoods[k][v].sum(0) for k, v in old_idxs.items()}
+            block_grads_old = {k: ref_log_likelihood_grads[k][v].sum(0) for k, v in old_idxs.items()}
+            block_hessians_old = {k: ref_log_likelihood_hessians[k][v].sum(0) for k, v in old_idxs.items()}
+        else:
+            block_values_new = log_likelihood_sum(ref_params_flat, new_idxs)
+            block_grads_new = jacobian(log_likelihood_sum)(ref_params_flat, new_idxs)
+            block_hessians_new = hessian(log_likelihood_sum)(ref_params_flat, new_idxs)
+            block_values_old = log_likelihood_sum(ref_params_flat, old_idxs)
+            block_grads_old = jacobian(log_likelihood_sum)(ref_params_flat, old_idxs)
+            block_hessians_old = hessian(log_likelihood_sum)(ref_params_flat, old_idxs)
+
+        values, grads, hessians = {}, {}, {}
+        for name in gibbs_sites:
+            values[name] = gibbs_state.ref_subsample_log_liks[name] + \
+                block_values_new[name] - block_values_old[name]
+            grads[name] = gibbs_state.ref_subsample_log_lik_grads[name] + \
+                block_grads_new[name] - block_grads_old[name]
+            hessians[name] = gibbs_state.ref_subsample_log_lik_hessians[name] + \
+                block_hessians_new[name] - block_hessians_old[name]
+
+        return u_new, DiffEstState(values, grads, hessians)
+
+    def estimator(likelihoods, params, gibbs_state):
         subsample_log_liks = defaultdict(float)
-        subsample_indices = {}
-        for (fn, value, name, subsample_dim, subsample_idx) in likelihoods.values():
-            subsample_log_liks[name] += _sum_all_except_at_dim(fn.log_prob(value), subsample_dim)
-            if name not in subsample_indices:
-                subsample_indices[name] = subsample_idx
+        for (fn, value, name, subsample_dim) in likelihoods.values():
+            subsample_log_liks[name] += fn.log_prob(value).sum()
 
         params_flat, _ = ravel_pytree(params)
         params_diff = params_flat - ref_params_flat
         log_lik_sum = 0.
-        # loop over all subsample sites
-        if using_lookup:
-            # NB: in GPU, indexing here is expensive, it is better to compute likelihood, grad, hessian directly
-            # m x 55 x 55 (m ~ sqrt(n) ~ 1000)
-            ref_subsample_log_lik = {k: v[subsample_indices[k]]
-                                     for k, v in ref_log_likelihoods.items()}
-            ref_subsample_log_lik_grad = {k: v[subsample_indices[k]]
-                                          for k, v in ref_log_likelihood_grads.items()}
-            ref_subsample_log_lik_hessian = {k: v[subsample_indices[k]]
-                                             for k, v in ref_log_likelihood_hessians.items()}
-        else:
-            ref_subsample_log_lik = log_likelihood_sum(ref_params_flat, subsample_indices)
-            ref_subsample_log_lik_grad = jacobian(log_likelihood_sum)(ref_params_flat, subsample_indices)
-            ref_subsample_log_lik_hessian = hessian(log_likelihood_sum)(ref_params_flat, subsample_indices)
-
         for name, subsample_log_lik in subsample_log_liks.items():
             n, m = subsample_plate_sizes[name]
-            subsample_idx = subsample_indices[name]
 
-            control_variates = ref_subsample_log_lik[name] + \
-                jnp.dot(ref_subsample_log_lik_grad[name], params_diff) + \
-                0.5 * jnp.dot(jnp.dot(ref_subsample_log_lik_hessian[name], params_diff), params_diff)
+            control_variates = gibbs_state.ref_subsample_log_liks[name] + \
+                jnp.dot(gibbs_state.ref_subsample_log_lik_grads[name], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(gibbs_state.ref_subsample_log_lik_hessians[name], params_diff), params_diff)
             diff = subsample_log_lik - control_variates
 
-            control_variates_sum = ref_log_likelihoods_sum[name] + \
-                jnp.dot(ref_log_likelihood_grads_sum[name], params_diff) + \
-                0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sum[name], params_diff), params_diff)
-            unbiased_log_lik = control_variates_sum + n * jnp.mean(diff)
-            variance = n ** 2 / m * jnp.var(diff)
-            log_lik_sum += unbiased_log_lik - 0.5 * variance
+            control_variates_sum = ref_log_likelihoods_sums[name] + \
+                jnp.dot(ref_log_likelihood_grads_sums[name], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sums[name], params_diff), params_diff)
+            unbiased_log_lik = control_variates_sum + n * diff / m
+            log_lik_sum += unbiased_log_lik
         return log_lik_sum
 
-    return estimator
+    return estimator, gibbs_init, gibbs_update
 
 
-# 1 idx -> 1 estimator
+def block_poisson_estimator(model, model_args, model_kwargs, subsample_plate_sizes, reference_params,
+                            num_blocks=1, using_lookup=False):
+    minibatch_size = 30
+    lower_bound = -num_blocks
+    # subsample_plate_sizes: name -> (size, subsample_size)
+    ref_params_flat, unravel_fn = ravel_pytree(reference_params)
+
+    def _sum_all_except_at_dim(x, dim):
+        x = x.reshape((-1,) + x.shape[dim:]).sum(0)
+        return x.reshape(x.shape[:1] + (-1,)).sum(-1)
+
+    def log_likelihood(params_flat, subsample_indices=None):
+        if subsample_indices is None:
+            subsample_indices = {k: jnp.arange(v[0]) for k, v in subsample_plate_sizes.items()}
+        params = unravel_fn(params_flat)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with block(), trace() as tr, substitute(data=subsample_indices), \
+                    substitute(substitute_fn=partial(_unconstrain_reparam, params)):
+                model(*model_args, **model_kwargs)
+
+        log_lik = {}
+        for site in tr.values():
+            if site["type"] == "sample" and site["is_observed"]:
+                for frame in site["cond_indep_stack"]:
+                    if frame.name in subsample_plate_sizes:
+                        if frame.name in log_lik:
+                            log_lik[frame.name] += _sum_all_except_at_dim(
+                                site["fn"].log_prob(site["value"]), frame.dim)
+                        else:
+                            log_lik[frame.name] = _sum_all_except_at_dim(
+                                site["fn"].log_prob(site["value"]), frame.dim)
+        return log_lik
+
+    def log_likelihood_sum(params_flat, subsample_indices=None):
+        return {k: v.sum() for k, v in log_likelihood(params_flat, subsample_indices).items()}
+
+    # those stats are dict keyed by subsample names
+    if using_lookup:
+        ref_log_likelihoods = log_likelihood(ref_params_flat)  # n
+        # NB: use jacfwd (instead of jacobian/jacrev) when out_dim >> in_dim
+        ref_log_likelihood_grads = jacfwd(log_likelihood)(ref_params_flat)
+        # TODO: resolve memory error for covtype data: data 500,000, params: 55
+        # fn: 55 -> n; grad(fn): 55 -> n x 55; grad(grad(fn)): 55 -> n x 55 x 55
+        ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
+        ref_log_likelihoods_sums = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
+        ref_log_likelihood_grads_sums = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
+        ref_log_likelihood_hessians_sums = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
+    else:
+        ref_log_likelihoods_sums = log_likelihood_sum(ref_params_flat)
+        ref_log_likelihood_grads_sums = jacobian(log_likelihood_sum)(ref_params_flat)
+        ref_log_likelihood_hessians_sums = hessian(log_likelihood_sum)(ref_params_flat)
+
+    def gibbs_init(rng_key, gibbs_sites):
+        if using_lookup:
+            ref_subsample_log_liks = {k: ref_log_likelihoods[k][v].sum() for k, v in gibbs_sites.items()}
+            ref_subsample_log_lik_grads = {k: ref_log_likelihood_grads[k][v].sum() for k, v in gibbs_sites.items()}
+            ref_subsample_log_lik_hessians = {k: ref_log_likelihood_hessians[k][v].sum()
+                                              for k, v in gibbs_sites.items()}
+        else:
+            # ref_subsample_log_liks = log_likelihood(ref_params_flat, gibbs_sites)
+            # ref_subsample_log_lik_grads = jacfwd(log_likelihood)(ref_params_flat, gibbs_sites)
+            # ref_subsample_log_lik_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat, gibbs_sites)
+            ref_subsample_log_liks = log_likelihood_sum(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_grads = jacrev(log_likelihood_sum)(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_hessians = jacfwd(jacrev(log_likelihood_sum))(ref_params_flat, gibbs_sites)
+        return DiffEstState(ref_subsample_log_liks, ref_subsample_log_lik_grads, ref_subsample_log_lik_hessians)
+
+    def gibbs_update(rng_key, gibbs_sites, gibbs_state):
+        u_new = {}
+        pads = {}
+        new_idxs = {}
+        starts = {}
+        new_states = defaultdict(dict)
+        for name, subsample_idx in gibbs_sites.items():
+            size, subsample_size = subsample_plate_sizes[name]
+            rng_key, subkey, block_key = random.split(rng_key, 3)
+            block_size = (subsample_size - 1) // num_blocks + 1
+            pad = block_size - (subsample_size - 1) % block_size - 1
+
+            chosen_block = random.randint(block_key, shape=(), minval=0, maxval=num_blocks)
+            new_idx = random.randint(subkey, minval=0, maxval=size, shape=(block_size,))
+            subsample_idx_padded = jnp.pad(subsample_idx, (0, pad))
+            start = chosen_block * block_size
+            subsample_idx_padded = lax.dynamic_update_slice_in_dim(
+                subsample_idx_padded, new_idx, start, 0)
+
+            u_new[name] = subsample_idx_padded[:subsample_size]
+            pads[name] = pad
+            new_idxs[name] = new_idx
+            starts[name] = start
+
+        # NB: in GPU, indexing here is expensive, it is better to compute likelihood, grad, hessian directly
+        # m x 55 x 55 (m ~ sqrt(n) ~ 1000)
+        if using_lookup:
+            for stat, all_values, last_values in zip(
+                    ["log_liks", "grads", "hessians"],
+                    [ref_log_likelihoods,
+                     ref_log_likelihood_grads,
+                     ref_log_likelihood_hessians],
+                    [gibbs_state.ref_subsample_log_liks,
+                     gibbs_state.ref_subsample_log_lik_grads,
+                     gibbs_state.ref_subsample_log_lik_hessians]):
+                for name, subsample_idx in gibbs_sites.items():
+                    size, subsample_size = subsample_plate_sizes[name]
+                    pad, new_idx, start = pads[name], new_idxs[name], starts[name]
+                    new_value = jnp.pad(last_values[name],
+                                        [(0, pad)] + [(0, 0)] * (jnp.ndim(last_values[name]) - 1))
+                    new_value = lax.dynamic_update_slice_in_dim(
+                        new_value, all_values[name][new_idx], start, 0)
+                    new_states[stat][name] = new_value[:subsample_size].sum(0)
+        else:
+            ref_subsample_log_liks = log_likelihood_sum(ref_params_flat, u_new)
+            ref_subsample_log_lik_grads = jacobian(log_likelihood_sum)(ref_params_flat, u_new)
+            ref_subsample_log_lik_hessians = hessian(log_likelihood_sum)(ref_params_flat, u_new)
+            for stat, new_values in zip(
+                    ["log_liks", "grads", "hessians"],
+                    [ref_subsample_log_liks,
+                     ref_subsample_log_lik_grads,
+                     ref_subsample_log_lik_hessians]):
+                new_states[stat] = new_values
+        gibbs_state = DiffEstState(new_states["log_liks"], new_states["grads"], new_states["hessians"])
+        return u_new, gibbs_state
+
+    def estimator(likelihoods, params, gibbs_state):
+        subsample_log_liks = defaultdict(float)
+        for (fn, value, name, subsample_dim) in likelihoods.values():
+            subsample_log_liks[name] += _sum_all_except_at_dim(fn.log_prob(value), subsample_dim).sum()
+
+        params_flat, _ = ravel_pytree(params)
+        params_diff = params_flat - ref_params_flat
+        log_lik_sum = 0.
+        for name, subsample_log_lik in subsample_log_liks.items():
+            n, m = subsample_plate_sizes[name]
+
+            control_variates = gibbs_state.ref_subsample_log_liks[name] + \
+                jnp.dot(gibbs_state.ref_subsample_log_lik_grads[name], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(gibbs_state.ref_subsample_log_lik_hessians[name], params_diff), params_diff)
+            diff = subsample_log_lik - control_variates
+
+            control_variates_sum = ref_log_likelihoods_sums[name] + \
+                jnp.dot(ref_log_likelihood_grads_sums[name], params_diff) + \
+                0.5 * jnp.dot(jnp.dot(ref_log_likelihood_hessians_sums[name], params_diff), params_diff)
+            unbiased_log_lik = control_variates_sum + n / m * diff
+            log_lik_sum += unbiased_log_lik
+        return log_lik_sum
+
+    return estimator, gibbs_init, gibbs_update
