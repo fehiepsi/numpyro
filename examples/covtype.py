@@ -78,20 +78,23 @@ def benchmark_hmc(args, features, labels):
         subsample_size = 1000
         inner_kernel = NUTS(model, init_strategy=init_to_value(values=ref_params),
                             dense_mass=args.dense_mass)
+        # note: if num_blocks=100, we'll update 10 index at each MCMC step
+        # so it took 50000 MCMC steps to iterative the whole dataset
         kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=ref_params)
     elif args.algo == "FlowHMCECS":
         subsample_size = 1000
         guide = AutoBNAFNormal(model, num_flows=1, hidden_factors=[8])
-        svi = SVI(model, guide, numpyro.optim.Adam(0.001), Trace_ELBO())
-        params, losses = svi.run(random.PRNGKey(2), 10000, features, labels)
+        svi = SVI(model, guide, numpyro.optim.Adam(0.01), Trace_ELBO())
+        params, losses = svi.run(random.PRNGKey(2), 2000, features, labels)
         plt.plot(losses)
 
         neutra = NeuTraReparam(guide, params)
         neutra_model = neutra.reparam(model)
         neutra_ref_params = {"auto_shared_latent": jnp.zeros(55)}
+        # no need to adapt mass matrix if the flow does a good job
         inner_kernel = NUTS(neutra_model, init_strategy=init_to_value(values=neutra_ref_params),
-                            dense_mass=args.dense_mass)
-        kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=neutra_ref_params, using_lookup=False)
+                            adapt_mass_matrix=False)
+        kernel = HMCECS(inner_kernel, num_blocks=100, reference_params=neutra_ref_params)
     else:
         raise ValueError("Invalid algorithm, either 'HMC', 'NUTS', or 'HMCECS'.")
     mcmc = MCMC(kernel, args.num_warmup, args.num_samples)
