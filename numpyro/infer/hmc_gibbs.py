@@ -6,7 +6,7 @@ import copy
 from functools import partial
 import warnings
 
-from jax import device_put, grad, hessian, jacfwd, jacrev, jacobian, lax, ops, random, value_and_grad
+from jax import device_put, grad, hessian, jacfwd, jacobian, lax, ops, random, value_and_grad
 import jax.numpy as jnp
 from jax.scipy.special import expit
 
@@ -672,14 +672,29 @@ def taylor_estimator(model, model_args, model_kwargs, subsample_plate_sizes, ref
     def log_likelihood_sum(params_flat, subsample_indices=None):
         return {k: v.sum() for k, v in log_likelihood(params_flat, subsample_indices).items()}
 
+    def one_site_log_lik(name, params_flat, idx):
+        subsample_indices = {k: jnp.array([]) for k in subsample_plate_sizes}
+        subsample_indices[name] = idx
+        return log_likelihood(params_flat, subsample_indices)[name]
+
     # those stats are dict keyed by subsample names
     if using_lookup:
         ref_log_likelihoods = log_likelihood(ref_params_flat)  # n
-        # NB: use jacfwd (instead of jacobian/jacrev) when out_dim >> in_dim
+        # NB: use jacfwd (instead of jacobian/jacrev) when out_dim >= in_dim
         ref_log_likelihood_grads = jacfwd(log_likelihood)(ref_params_flat)
-        # TODO: resolve memory error for covtype data: data 500,000, params: 55
+        # XXX: resolve memory error for covtype data: data 500,000, params: 55
         # fn: 55 -> n; grad(fn): 55 -> n x 55; grad(grad(fn)): 55 -> n x 55 x 55
-        ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
+        # ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
+        ref_log_likelihood_hessians = {}
+        for name, (size, subsample_size) in subsample_plate_sizes.items():
+            size_ = size + subsample_size - (size - 1) % subsample_size - 1
+            batch_idxs = jnp.reshape(jnp.arange(size_), (-1, subsample_size))
+            hessians = []
+            jit_hessian = jacfwd(jacfwd(partial(one_site_log_lik, name)))
+            for i in range(batch_idxs.shape[0]):
+                hessians.append(jit_hessian(ref_params_flat, batch_idxs[i]))
+            ref_log_likelihood_hessians[name] = jnp.concatenate(hessians)[:size]
+
         ref_log_likelihoods_sums = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
         ref_log_likelihood_grads_sums = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
         ref_log_likelihood_hessians_sums = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
@@ -827,6 +842,11 @@ def taylor_estimator_no_variance(model, model_args, model_kwargs, subsample_plat
     def log_likelihood_sum(params_flat, subsample_indices=None):
         return {k: v.sum() for k, v in log_likelihood(params_flat, subsample_indices).items()}
 
+    def one_site_log_lik(name, params_flat, idx):
+        subsample_indices = {k: jnp.array([]) for k in subsample_plate_sizes}
+        subsample_indices[name] = idx
+        return log_likelihood(params_flat, subsample_indices)[name]
+
     # those stats are dict keyed by subsample names
     if using_lookup:
         ref_log_likelihoods = log_likelihood(ref_params_flat)  # n
@@ -834,7 +854,17 @@ def taylor_estimator_no_variance(model, model_args, model_kwargs, subsample_plat
         ref_log_likelihood_grads = jacfwd(log_likelihood)(ref_params_flat)
         # TODO: resolve memory error for covtype data: data 500,000, params: 55
         # fn: 55 -> n; grad(fn): 55 -> n x 55; grad(grad(fn)): 55 -> n x 55 x 55
-        ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
+        # ref_log_likelihood_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat)  # n x 55 x 55
+        ref_log_likelihood_hessians = {}
+        for name, (size, subsample_size) in subsample_plate_sizes.items():
+            size_ = size + subsample_size - (size - 1) % subsample_size - 1
+            batch_idxs = jnp.reshape(jnp.arange(size_), (-1, subsample_size))
+            hessians = []
+            jit_hessian = jacfwd(jacfwd(partial(one_site_log_lik, name)))
+            for i in range(batch_idxs.shape[0]):
+                hessians.append(jit_hessian(ref_params_flat, batch_idxs[i]))
+            ref_log_likelihood_hessians[name] = jnp.concatenate(hessians)[:size]
+
         ref_log_likelihoods_sums = {k: v.sum(0) for k, v in ref_log_likelihoods.items()}
         ref_log_likelihood_grads_sums = {k: v.sum(0) for k, v in ref_log_likelihood_grads.items()}
         ref_log_likelihood_hessians_sums = {k: v.sum(0) for k, v in ref_log_likelihood_hessians.items()}  # 55 x 55
@@ -999,8 +1029,8 @@ def block_poisson_estimator(model, model_args, model_kwargs, subsample_plate_siz
             # ref_subsample_log_lik_grads = jacfwd(log_likelihood)(ref_params_flat, gibbs_sites)
             # ref_subsample_log_lik_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat, gibbs_sites)
             ref_subsample_log_liks = log_likelihood_sum(ref_params_flat, gibbs_sites)
-            ref_subsample_log_lik_grads = jacrev(log_likelihood_sum)(ref_params_flat, gibbs_sites)
-            ref_subsample_log_lik_hessians = jacfwd(jacrev(log_likelihood_sum))(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_grads = jacfwd(log_likelihood_sum)(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_hessians = jacfwd(jacfwd(log_likelihood_sum))(ref_params_flat, gibbs_sites)
         return DiffEstState(ref_subsample_log_liks, ref_subsample_log_lik_grads, ref_subsample_log_lik_hessians)
 
     def gibbs_update(rng_key, gibbs_sites, gibbs_state):
