@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.examples.datasets import COVTYPE, load_dataset
-from numpyro.infer import HMC, HMCECS, MCMC, NUTS, SVI, Trace_ELBO, init_to_value
+from numpyro.infer import HMC, HMCECS, MCMC, NUTS, SA, SVI, Trace_ELBO, init_to_value
 from numpyro.infer.autoguide import AutoBNAFNormal, AutoNormal
 from numpyro.infer.hmc_gibbs import taylor_proxy, variational_proxy
 from numpyro.infer.reparam import NeuTraReparam
@@ -74,6 +74,9 @@ def benchmark_hmc(args, features, labels):
         subsample_size = None
     elif args.algo == "NUTS":
         kernel = NUTS(model, dense_mass=args.dense_mass)
+        subsample_size = None
+    elif args.algo == "SA":
+        kernel = SA(model, adapt_state_size=1000)
         subsample_size = None
     elif args.algo == "HMCECS":
         subsample_size = 1000

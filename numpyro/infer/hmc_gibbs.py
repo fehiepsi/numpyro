@@ -793,18 +793,32 @@ def variational_proxy(guide, guide_params, num_samples=10):
         posterior_samples = _predictive(pos_key, guide_with_params, {}, (num_samples,), return_sites=return_sites,
                                         parallel=True, model_args=model_args, model_kwargs=model_kwargs)
         log_likelihood_ref = vmap(log_likelihood)(posterior_samples)
-        log_likelihood_ref = {k: v.sum(0) for k, v in log_likelihood_ref.items()}
+        log_likelihood_ref_sum = {k: v.sum(0) for k, v in log_likelihood_ref.items()}
+        log_likelihood_ref_particles = {k: v.sum(1) for k, v in log_likelihood_ref.items()}
 
-        weights = {name: log_like / log_like.sum() for name, log_like in log_likelihood_ref.items()}
+        def distance(x, y):
+            x_flat, _ = ravel_pytree(x)
+            y_flat, _ = ravel_pytree(y)
+            return jnp.exp(-jnp.mean(jnp.square(x_flat - y_flat)) * 10)  # TODO: control variance
+
+        def get_weights(params, subsample_log_liks):
+            coefs = vmap(partial(distance, params))(posterior_samples)
+            weights = {}
+            for name, log_lik in subsample_log_liks.items():
+                weights[name] = jnp.dot(coefs, log_lik) / jnp.dot(coefs, log_likelihood_ref_particles[name])
+            return weights
+
+        # weights = {name: log_like / log_like.sum() for name, log_like in log_likelihood_ref_sum.items()}
 
         log_prior_prob = vmap(log_prior)(posterior_samples).sum()
         log_posterior_prob = vmap(log_posterior)(posterior_samples).sum()
         evidence = {name: (log_posterior_prob - log_prior_prob - log_like.sum()) / num_samples
-                    for name, log_like in log_likelihood_ref.items()}
+                    for name, log_like in log_likelihood_ref_sum.items()}
 
         def gibbs_init(rng_key, gibbs_sites):
             return VariationalProxyState(
-                {name: weights[name][subsample_idx] for name, subsample_idx in gibbs_sites.items()})
+                # {name: weights[name][subsample_idx] for name, subsample_idx in gibbs_sites.items()})
+                {name: log_likelihood_ref[name][:, subsample_idx] for name, subsample_idx in gibbs_sites.items()})
 
         def gibbs_update(rng_key, gibbs_sites, gibbs_state):
             u_new, pads, new_idxs, starts = _block_update_proxy(num_blocks, rng_key, gibbs_sites, subsample_plate_sizes)
@@ -812,11 +826,12 @@ def variational_proxy(guide, guide_params, num_samples=10):
             new_subsample_weights = {}
             for name, subsample_weights in gibbs_state.subsample_weights.items():
                 size, subsample_size = subsample_plate_sizes[name]  # TODO: fix duplication!
-                pad, new_idx, start = pads[name], new_idxs[name], starts[name]
-                new_value = jnp.pad(subsample_weights,
-                                    [(0, pad)] + [(0, 0)] * (jnp.ndim(subsample_weights) - 1))
-                new_value = lax.dynamic_update_slice_in_dim(new_value, weights[name][new_idx], start, 0)
-                new_subsample_weights[name] = new_value[:subsample_size]
+                # pad, new_idx, start = pads[name], new_idxs[name], starts[name]
+                # new_value = jnp.pad(subsample_weights,
+                #                     [(0, pad)] + [(0, 0)] * (jnp.ndim(subsample_weights) - 1))
+                # new_value = lax.dynamic_update_slice_in_dim(new_value, weights[name][new_idx], start, 0)
+                # new_subsample_weights[name] = new_value[:subsample_size]
+                new_subsample_weights[name] = log_likelihood_ref[name][:, u_new[name]]
             gibbs_state = VariationalProxyState(new_subsample_weights)
             return u_new, gibbs_state
 
@@ -827,13 +842,15 @@ def variational_proxy(guide, guide_params, num_samples=10):
             # TODO: convert params to constrained space
             log_prior_prob = log_prior(params)
             log_posterior_prob = log_posterior(params)
+            subsample_log_liks = gibbs_state.subsample_weights
+            weights = get_weights(params, subsample_log_liks)
 
             for name in subsample_lik_sites:
                 proxy_sum[name] = log_posterior_prob - log_prior_prob - evidence[name]
                 # FIXME: what is a correct formula?
                 # proxy_subsample[name] = gibbs_state.subsample_weights[name] * (
                 #     log_posterior_prob - log_prior_prob) - evidence[name]
-                proxy_subsample[name] = gibbs_state.subsample_weights[name] * proxy_sum[name]
+                proxy_subsample[name] = weights[name] * proxy_sum[name]
             return proxy_sum, proxy_subsample
 
         return proxy_fn, gibbs_init, gibbs_update
