@@ -177,29 +177,41 @@ class BarkerMH(MCMCKernel):
         shape = jnp.shape(x_flat)
         rng_key, key_normal, key_bernoulli, key_accept = random.split(rng_key, 4)
 
-        if self._dense_mass:
-            mass_sqrt = jnp.transpose(jnp.linalg.inv(adapt_state.mass_matrix_sqrt))
-        else:
-            mass_sqrt = 1.0 / adapt_state.mass_matrix_sqrt
+        # if self._dense_mass:
+        #     mass_sqrt = jnp.transpose(jnp.linalg.inv(adapt_state.mass_matrix_sqrt))
+        # else:
+        #     mass_sqrt = 1.0 / adapt_state.mass_matrix_sqrt
 
         # Generate proposal y.
-        z = adapt_state.step_size * random.normal(key_normal, shape)
+        r_base = adapt_state.step_size * random.normal(key_normal, shape)
         if self._dense_mass:
-            z_proposal = jnp.matmul(mass_sqrt, z)
+            r = jnp.matmul(adapt_state.mass_matrix_sqrt, r_base)
+            x_grad_flat_scaled = adapt_state.mass_matrix_sqrt.T @ (adapt_state.inverse_mass_matrix @ x_grad_flat)
+            ke_grad = adapt_state.inverse_mass_matrix @ r
         else:
-            z_proposal = mass_sqrt * z
+            r = adapt_state.mass_matrix_sqrt * r_base
+            x_grad_flat_scaled = adapt_state.mass_matrix_sqrt * adapt_state.inverse_mass_matrix * x_grad_flat
+            ke_grad = adapt_state.inverse_mass_matrix * r
 
-        p = expit(-z_proposal * x_grad_flat)
+        p = expit(-r_base * x_grad_flat_scaled)
         b = jnp.where(random.uniform(key_bernoulli, shape) < p, 1., -1.)
 
-        dx_flat = b * z_proposal
+        # r -> r - step_size * z_grad
+        dx_flat = b * ke_grad
         y_flat = x_flat + dx_flat
 
         y = unravel_fn(y_flat)
         y_pe, y_grad = jax.value_and_grad(self._potential_fn)(y)
         y_grad_flat, _ = ravel_pytree(y_grad)
 
-        log_accept_ratio = x_pe - y_pe + jnp.sum(softplus(dx_flat * x_grad_flat) - softplus(-dx_flat * y_grad_flat))
+        if self._dense_mass:
+            y_grad_flat_scaled = adapt_state.mass_matrix_sqrt.T @ (adapt_state.inverse_mass_matrix @ y_grad_flat)
+        else:
+            y_grad_flat_scaled = adapt_state.mass_matrix_sqrt * adapt_state.inverse_mass_matrix * y_grad_flat
+
+        dx_base = b * r_base
+        log_accept_ratio = x_pe - y_pe + jnp.sum(softplus(dx_base * x_grad_flat_scaled)
+                                                 - softplus(-dx_base * y_grad_flat_scaled))
         accept_prob = jnp.clip(jnp.exp(log_accept_ratio), a_max=1.)
 
         x, x_flat, pe, x_grad = jax.lax.cond(random.bernoulli(key_accept, accept_prob),
