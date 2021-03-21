@@ -585,10 +585,9 @@ def test_lift_memoize():
             model()
 
 
-@pytest.mark.xfail(reason="Issue: https://github.com/pyro-ppl/numpyro/issues/964")
 def test_collapse_beta_binomial():
     total_count = 10
-    data = 3.
+    data = np.array(3)
 
     def model1():
         c1 = numpyro.param("c1", 0.5, constraint=dist.constraints.positive)
