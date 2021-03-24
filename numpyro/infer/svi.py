@@ -5,7 +5,8 @@ from functools import namedtuple, partial
 
 import tqdm
 
-from jax import jit, lax, random, tree_map
+import jax
+from jax import jit, lax, random
 import jax.numpy as jnp
 
 from numpyro.distributions import constraints
@@ -118,7 +119,7 @@ class SVI(object):
         self.constrain_fn = partial(transform_fn, inv_transforms)
         # we convert weak types like float to float32/float64
         # to avoid recompiling body_fn in svi.run
-        params = tree_map(lambda x: lax.convert_element_type(x, jnp.result_type(x)), params)
+        params = jax.tree_util.tree_map(lambda x: lax.convert_element_type(x, jnp.result_type(x)), params)
         return SVIState(self.optim.init(params), rng_key)
 
     def get_params(self, svi_state):

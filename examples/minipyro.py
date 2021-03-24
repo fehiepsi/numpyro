@@ -5,7 +5,6 @@ import argparse
 
 from jax import random
 import jax.numpy as jnp
-from jax.random import PRNGKey
 
 import numpyro
 from numpyro import optim
@@ -29,14 +28,14 @@ def guide(data):
 
 def main(args):
     # Generate some data.
-    data = random.normal(PRNGKey(0), shape=(100,)) + 3.0
+    data = random.normal(random.PRNGKey(0), shape=(100,)) + 3.0
 
     # Construct an SVI object so we can do variational inference on our
     # model/guide pair.
     adam = optim.Adam(args.learning_rate)
 
     svi = SVI(model, guide, adam, Trace_ELBO(num_particles=100))
-    svi_state = svi.init(PRNGKey(0), data)
+    svi_state = svi.init(random.PRNGKey(0), data)
 
     # Training loop
     def body_fn(i, val):

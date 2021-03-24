@@ -12,7 +12,7 @@ import tqdm
 from tqdm.auto import tqdm as tqdm_auto
 
 import jax
-from jax import device_put, jit, lax, ops, vmap
+from jax import device_put, jit, lax, vmap
 from jax.core import Tracer
 from jax.experimental import host_callback
 import jax.numpy as jnp
@@ -285,7 +285,7 @@ def fori_collect(lower, upper, body_fun, init_val, transform=identity,
         idx = (i - start_idx) // thinning
         collection = cond(idx >= 0,
                           collection,
-                          lambda x: ops.index_update(x, idx, ravel_pytree(transform(val))[0]),
+                          lambda x: x.at[idx].update(ravel_pytree(transform(val))[0]),
                           collection,
                           identity)
         return val, collection, start_idx, thinning

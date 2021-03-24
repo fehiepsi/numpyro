@@ -4,7 +4,7 @@
 from collections import namedtuple
 from functools import partial
 
-from jax import grad, jacfwd, lax, ops, random
+from jax import grad, jacfwd, lax, random
 import jax.numpy as jnp
 
 from numpyro.infer.hmc import momentum_generator
@@ -121,7 +121,7 @@ class MixedHMC(DiscreteHMCGibbs):
                 identity)
 
             delta_pe_sum = delta_pe_sum + pe - hmc_state.potential_energy
-            ke_discrete = ops.index_update(ke_discrete, idx, ke_discrete_i)
+            ke_discrete = ke_discrete.at[idx].set(ke_discrete_i)
             hmc_state = hmc_state._replace(potential_energy=pe, z_grad=z_grad)
             return rng_key, hmc_state, z_discrete, ke_discrete, delta_pe_sum
 
@@ -145,7 +145,7 @@ class MixedHMC(DiscreteHMCGibbs):
             # (see the note at total_time below)
             trajectory_length = arrival_times[idx] * time_unit
             arrival_times = arrival_times - arrival_times[idx]
-            arrival_times = ops.index_update(arrival_times, idx, 1.)
+            arrival_times = arrival_times.at[idx].set(1.)
 
             # this is a trick, so that in a sub-trajectory of HMC, we always accept the new proposal
             pe = jnp.inf

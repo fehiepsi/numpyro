@@ -37,7 +37,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import gaussian_kde
 
-from jax import lax, random
+import jax
+from jax import random
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
 
@@ -99,7 +100,7 @@ def forward_log_prob(init_log_prob, words, transition_log_prob, emission_log_pro
         for word in words:
             log_prob = forward_one_step(log_prob, word, transition_log_prob, emission_log_prob)
     else:
-        log_prob, _ = lax.scan(scan_fn, init_log_prob, words)
+        log_prob, _ = jax.lax.scan(scan_fn, init_log_prob, words)
     return log_prob
 
 

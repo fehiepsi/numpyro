@@ -6,8 +6,8 @@ from contextlib import ExitStack, contextmanager
 import functools
 import warnings
 
-from jax import lax, ops, random
-from jax.lib import xla_bridge
+import jax
+from jax import lax, random
 import jax.numpy as jnp
 
 import numpyro
@@ -300,7 +300,7 @@ def module(name, nn, input_shape=None):
 
 def _subsample_fn(size, subsample_size, rng_key=None):
     assert rng_key is not None, "Missing random key to generate subsample indices."
-    if xla_bridge.get_backend().platform == 'cpu':
+    if jax.default_backend() == 'cpu':
         # ref: https://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle#The_modern_algorithm
         rng_keys = random.split(rng_key, subsample_size)
 
@@ -308,7 +308,7 @@ def _subsample_fn(size, subsample_size, rng_key=None):
             i_p1 = size - idx
             i = i_p1 - 1
             j = random.randint(rng_keys[idx], (), 0, i_p1)
-            val = ops.index_update(val, ops.index[[i, j], ], val[ops.index[[j, i], ]])
+            val = val.at[[i, j], ].set(val[[j, i], ])
             return val, None
 
         val, _ = lax.scan(body_fn, jnp.arange(size), jnp.arange(subsample_size))

@@ -26,10 +26,9 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 
-from jax import lax, ops, tree_map
-import jax.nn as nn
+import jax
+from jax import lax, random
 import jax.numpy as jnp
-import jax.random as random
 from jax.scipy.linalg import cho_solve, solve_triangular
 from jax.scipy.special import betainc, expit, gammaln, logit, logsumexp, multigammaln, ndtr, ndtri
 
@@ -147,7 +146,7 @@ class Dirichlet(Distribution):
         # and apply softmax to get a dirichlet sample
         gamma_samples = random.gamma(key_gamma, self.concentration + 1, shape=shape)
         expon_samples = random.exponential(key_expon, shape=shape)
-        samples = nn.softmax(jnp.log(gamma_samples) - expon_samples / self.concentration, -1)
+        samples = jax.nn.softmax(jnp.log(gamma_samples) - expon_samples / self.concentration, -1)
         return jnp.clip(samples, a_min=jnp.finfo(samples).tiny, a_max=1 - jnp.finfo(samples).eps)
 
     @validate_sample
@@ -595,8 +594,7 @@ class LKJCholesky(Distribution):
         w = jnp.expand_dims(jnp.sqrt(beta_sample), axis=-1) * u_hypershere
 
         # put w into the off-diagonal triangular part
-        cholesky = ops.index_add(jnp.zeros(size + self.batch_shape + self.event_shape),
-                                 ops.index[..., 1:, :-1], w)
+        cholesky = jnp.zeros(size + self.batch_shape + self.event_shape).at[..., 1:, :-1].add(w)
         # correct the diagonal
         # NB: we clip due to numerical precision
         diag = jnp.sqrt(jnp.clip(1 - jnp.sum(cholesky ** 2, axis=-1), a_min=0.))
@@ -704,7 +702,7 @@ class Logistic(Distribution):
     @validate_sample
     def log_prob(self, value):
         log_exponent = (self.loc - value) / self.scale
-        log_denominator = jnp.log(self.scale) + 2 * nn.softplus(log_exponent)
+        log_denominator = jnp.log(self.scale) + 2 * jax.nn.softplus(log_exponent)
         return log_exponent - log_denominator
 
     @property
@@ -1145,7 +1143,7 @@ class LeftTruncatedDistribution(Distribution):
         assert base_dist.support is constraints.real, \
             "The base distribution should be univariate and have real support."
         batch_shape = lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(low))
-        self.base_dist = tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
+        self.base_dist = jax.tree_util.tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
         self.low, = promote_shapes(low, shape=batch_shape)
         self._support = constraints.greater_than(low)
         super().__init__(batch_shape, validate_args=validate_args)
@@ -1209,7 +1207,7 @@ class RightTruncatedDistribution(Distribution):
         assert base_dist.support is constraints.real, \
             "The base distribution should be univariate and have real support."
         batch_shape = lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(high))
-        self.base_dist = tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
+        self.base_dist = jax.tree_util.tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
         self.high, = promote_shapes(high, shape=batch_shape)
         self._support = constraints.less_than(high)
         super().__init__(batch_shape, validate_args=validate_args)
@@ -1260,7 +1258,7 @@ class TwoSidedTruncatedDistribution(Distribution):
         assert base_dist.support is constraints.real, \
             "The base distribution should be univariate and have real support."
         batch_shape = lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(low), jnp.shape(high))
-        self.base_dist = tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
+        self.base_dist = jax.tree_util.tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
         self.low, = promote_shapes(low, shape=batch_shape)
         self.high, = promote_shapes(high, shape=batch_shape)
         self._support = constraints.interval(low, high)

@@ -55,8 +55,8 @@ it is better to disable progress bar to avoid dispatching overhead.
 import argparse
 import os
 
+from jax import random
 import jax.numpy as jnp
-import jax.random as random
 from jax.scipy.special import logsumexp
 
 import numpyro

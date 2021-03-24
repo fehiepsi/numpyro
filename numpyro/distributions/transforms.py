@@ -7,7 +7,8 @@ import weakref
 
 import numpy as np
 
-from jax import lax, ops, tree_flatten, tree_map, vmap
+import jax
+from jax import lax
 from jax.flatten_util import ravel_pytree
 from jax.nn import softplus
 import jax.numpy as jnp
@@ -647,9 +648,8 @@ class PermuteTransform(Transform):
 
     def _inverse(self, y):
         size = self.permutation.size
-        permutation_inv = ops.index_update(jnp.zeros(size, dtype=jnp.result_type(int)),
-                                           self.permutation,
-                                           jnp.arange(size))
+        permutation_inv = jnp.zeros(size, dtype=jnp.result_type(int)).at[
+            self.permutation].set(jnp.arange(size))
         return y[..., permutation_inv]
 
     def log_abs_det_jacobian(self, x, y, intermediates=None):
@@ -807,14 +807,14 @@ class UnpackTransform(Transform):
     def __call__(self, x):
         batch_shape = x.shape[:-1]
         if batch_shape:
-            unpacked = vmap(self.unpack_fn)(x.reshape((-1,) + x.shape[-1:]))
-            return tree_map(lambda z: jnp.reshape(z, batch_shape + z.shape[1:]), unpacked)
+            unpacked = jax.vmap(self.unpack_fn)(x.reshape((-1,) + x.shape[-1:]))
+            return jax.tree_util.tree_map(lambda z: jnp.reshape(z, batch_shape + z.shape[1:]), unpacked)
         else:
             return self.unpack_fn(x)
 
     def _inverse(self, y):
         leading_dims = [v.shape[0] if jnp.ndim(v) > 0 else 0
-                        for v in tree_flatten(y)[0]]
+                        for v in jax.tree_util.tree_flatten(y)[0]]
         d0 = leading_dims[0]
         not_scalar = d0 > 0 or len(leading_dims) > 1
         if not_scalar and all(d == d0 for d in leading_dims[1:]):
