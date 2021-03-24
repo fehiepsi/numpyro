@@ -244,7 +244,7 @@ def find_valid_initial_params(rng_key, model,
             z_grad = jax.jacfwd(potential_fn)(params)
         else:
             pe, z_grad = jax.value_and_grad(potential_fn)(params)
-        z_grad_flat = jax.tree_util.ravel_pytree(z_grad)[0]
+        z_grad_flat = jax.flatten_util.ravel_pytree(z_grad)[0]
         is_valid = jnp.isfinite(pe) & jnp.all(jnp.isfinite(z_grad_flat))
         return i + 1, key, (params, pe, z_grad), is_valid
 

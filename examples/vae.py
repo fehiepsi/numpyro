@@ -13,10 +13,10 @@ import time
 
 import matplotlib.pyplot as plt
 
-from jax import jit, lax, random
+import jax
+from jax import random
 from jax.experimental import stax
 import jax.numpy as jnp
-from jax.random import PRNGKey
 
 import numpyro
 from numpyro import optim
@@ -63,7 +63,7 @@ def guide(batch, hidden_dim=400, z_dim=100):
     return z
 
 
-@jit
+@jax.jit
 def binarize(rng_key, batch):
     return random.bernoulli(rng_key, batch).astype(batch.dtype)
 
@@ -73,7 +73,7 @@ def main(args):
     decoder_nn = decoder(args.hidden_dim, 28 * 28)
     adam = optim.Adam(args.learning_rate)
     svi = SVI(model, guide, adam, Trace_ELBO(), hidden_dim=args.hidden_dim, z_dim=args.z_dim)
-    rng_key = PRNGKey(0)
+    rng_key = random.PRNGKey(0)
     train_init, train_fetch = load_dataset(MNIST, batch_size=args.batch_size, split='train')
     test_init, test_fetch = load_dataset(MNIST, batch_size=args.batch_size, split='test')
     num_train, train_idx = train_init()
@@ -81,7 +81,7 @@ def main(args):
     sample_batch = binarize(rng_key_binarize, train_fetch(0, train_idx)[0])
     svi_state = svi.init(rng_key_init, sample_batch)
 
-    @jit
+    @jax.jit
     def epoch_train(svi_state, rng_key, train_idx):
         def body_fn(i, val):
             loss_sum, svi_state = val
@@ -91,9 +91,9 @@ def main(args):
             loss_sum += loss
             return loss_sum, svi_state
 
-        return lax.fori_loop(0, num_train, body_fn, (0., svi_state))
+        return jax.lax.fori_loop(0, num_train, body_fn, (0., svi_state))
 
-    @jit
+    @jax.jit
     def eval_test(svi_state, rng_key, test_idx):
         def body_fun(i, loss_sum):
             rng_key_binarize = random.fold_in(rng_key, i)
@@ -103,7 +103,7 @@ def main(args):
             loss_sum += loss
             return loss_sum
 
-        loss = lax.fori_loop(0, num_test, body_fun, 0.)
+        loss = jax.lax.fori_loop(0, num_test, body_fun, 0.)
         loss = loss / num_test
         return loss
 

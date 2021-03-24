@@ -37,7 +37,8 @@ import os
 
 import numpy as np
 
-from jax import nn, random
+import jax
+from jax import random
 import jax.numpy as jnp
 
 import numpyro
@@ -145,7 +146,7 @@ def mace(positions, annotations):
 
         with numpyro.plate("position", num_positions):
             s = numpyro.sample("s", dist.Bernoulli(1 - theta[positions]))
-            probs = jnp.where(s[..., None] == 0, nn.one_hot(c, num_classes), epsilon[positions])
+            probs = jnp.where(s[..., None] == 0, jax.nn.one_hot(c, num_classes), epsilon[positions])
             numpyro.sample("y", dist.Categorical(probs), obs=annotations)
 
 

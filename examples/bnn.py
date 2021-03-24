@@ -20,9 +20,9 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
-from jax import vmap
+import jax
+from jax import random
 import jax.numpy as jnp
-import jax.random as random
 
 import numpyro
 from numpyro import handlers
@@ -116,7 +116,7 @@ def main(args):
 
     # predict Y_test at inputs X_test
     vmap_args = (samples, random.split(rng_key_predict, args.num_samples * args.num_chains))
-    predictions = vmap(lambda samples, rng_key: predict(model, rng_key, samples, X_test, D_H))(*vmap_args)
+    predictions = jax.vmap(lambda samples, rng_key: predict(model, rng_key, samples, X_test, D_H))(*vmap_args)
     predictions = predictions[..., 0]
 
     # compute mean prediction and confidence interval around median

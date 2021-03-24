@@ -41,8 +41,8 @@ import matplotlib
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 
+from jax import random
 import jax.numpy as jnp
-import jax.random as random
 
 import numpyro
 import numpyro.distributions as dist

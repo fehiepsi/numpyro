@@ -29,9 +29,8 @@ import time
 import numpy as np
 
 import jax
-from jax import vmap
+from jax import random
 import jax.numpy as jnp
-import jax.random as random
 from jax.scipy.linalg import cho_factor, cho_solve, solve_triangular
 
 import numpyro
@@ -245,9 +244,9 @@ def get_data(N=20, S=2, P=10, sigma_obs=0.05):
 # Helper function for analyzing the posterior statistics for coefficient theta_i
 def analyze_dimension(samples, X, Y, dimension, hypers):
     vmap_args = (samples['msq'], samples['lambda'], samples['eta1'], samples['xisq'], samples['sigma'])
-    mus, variances = vmap(lambda msq, lam, eta1, xisq, sigma:
-                          compute_singleton_mean_variance(X, Y, dimension, msq, lam,
-                                                          eta1, xisq, hypers['c'], sigma))(*vmap_args)
+    mus, variances = jax.vmap(lambda msq, lam, eta1, xisq, sigma:
+                              compute_singleton_mean_variance(X, Y, dimension, msq, lam,
+                                                              eta1, xisq, hypers['c'], sigma))(*vmap_args)
     mean, variance = gaussian_mixture_stats(mus, variances)
     std = jnp.sqrt(variance)
     return mean, std
@@ -256,9 +255,9 @@ def analyze_dimension(samples, X, Y, dimension, hypers):
 # Helper function for analyzing the posterior statistics for coefficient theta_ij
 def analyze_pair_of_dimensions(samples, X, Y, dim1, dim2, hypers):
     vmap_args = (samples['msq'], samples['lambda'], samples['eta1'], samples['xisq'], samples['sigma'])
-    mus, variances = vmap(lambda msq, lam, eta1, xisq, sigma:
-                          compute_pairwise_mean_variance(X, Y, dim1, dim2, msq, lam,
-                                                         eta1, xisq, hypers['c'], sigma))(*vmap_args)
+    mus, variances = jax.vmap(lambda msq, lam, eta1, xisq, sigma:
+                              compute_pairwise_mean_variance(X, Y, dim1, dim2, msq, lam,
+                                                             eta1, xisq, hypers['c'], sigma))(*vmap_args)
     mean, variance = gaussian_mixture_stats(mus, variances)
     std = jnp.sqrt(variance)
     return mean, std
@@ -279,7 +278,7 @@ def main(args):
     samples = run_inference(model, args, rng_key, X, Y, hypers)
 
     # compute the mean and square root variance of each coefficient theta_i
-    means, stds = vmap(lambda dim: analyze_dimension(samples, X, Y, dim, hypers))(jnp.arange(args.num_dimensions))
+    means, stds = jax.vmap(lambda dim: analyze_dimension(samples, X, Y, dim, hypers))(jnp.arange(args.num_dimensions))
 
     print("Coefficients theta_1 to theta_%d used to generate the data:" % args.active_dimensions, expected_thetas)
     print("The single quadratic coefficient theta_{1,2} used to generate the data:", expected_pairwise)
@@ -300,8 +299,8 @@ def main(args):
     # Note that the resulting numbers are only meaningful for i != j.
     if len(active_dimensions) > 0:
         dim_pairs = jnp.array(list(itertools.product(active_dimensions, active_dimensions)))
-        means, stds = vmap(lambda dim_pair: analyze_pair_of_dimensions(samples, X, Y,
-                                                                       dim_pair[0], dim_pair[1], hypers))(dim_pairs)
+        means, stds = jax.vmap(lambda dim_pair: analyze_pair_of_dimensions(samples, X, Y,
+                                                                           dim_pair[0], dim_pair[1], hypers))(dim_pairs)
         for dim_pair, mean, std in zip(dim_pairs, means, stds):
             dim1, dim2 = dim_pair
             if dim1 >= dim2:

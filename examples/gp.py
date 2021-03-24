@@ -21,9 +21,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import jax
-from jax import vmap
+from jax import random
 import jax.numpy as jnp
-import jax.random as random
 
 import numpyro
 import numpyro.distributions as dist
@@ -121,8 +120,8 @@ def main(args):
     # do prediction
     vmap_args = (random.split(rng_key_predict, samples['kernel_var'].shape[0]),
                  samples['kernel_var'], samples['kernel_length'], samples['kernel_noise'])
-    means, predictions = vmap(lambda rng_key, var, length, noise:
-                              predict(rng_key, X, Y, X_test, var, length, noise))(*vmap_args)
+    means, predictions = jax.vmap(lambda rng_key, var, length, noise:
+                                  predict(rng_key, X, Y, X_test, var, length, noise))(*vmap_args)
 
     mean_prediction = np.mean(means, axis=0)
     percentiles = np.percentile(predictions, [5.0, 95.0], axis=0)

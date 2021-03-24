@@ -777,8 +777,8 @@ def _iterative_build_subtree(prototype_tree, vv_update, kinetic_fn,
         # we update checkpoints when leaf_idx is even
         r_ckpts, r_sum_ckpts = cond(leaf_idx % 2 == 0,
                                     (r_ckpts, r_sum_ckpts),
-                                    lambda x: (x[0].at[ckpt_idx_max](r),
-                                               x[1].at[ckpt_idx_max](r_sum)),
+                                    lambda x: (x[0].at[ckpt_idx_max].set(r),
+                                               x[1].at[ckpt_idx_max].set(r_sum)),
                                     (r_ckpts, r_sum_ckpts),
                                     identity)
 
