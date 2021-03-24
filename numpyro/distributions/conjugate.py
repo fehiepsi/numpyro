@@ -1,7 +1,8 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from jax import lax, random
+import jax
+from jax import random
 import jax.numpy as jnp
 from jax.scipy.special import betaln, gammaln
 
@@ -40,7 +41,7 @@ class BetaBinomial(Distribution):
         self.concentration1, self.concentration0, self.total_count = promote_shapes(
             concentration1, concentration0, total_count
         )
-        batch_shape = lax.broadcast_shapes(jnp.shape(concentration1), jnp.shape(concentration0),
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(concentration1), jnp.shape(concentration0),
                                            jnp.shape(total_count))
         concentration1 = jnp.broadcast_to(concentration1, batch_shape)
         concentration0 = jnp.broadcast_to(concentration0, batch_shape)
@@ -92,7 +93,7 @@ class DirichletMultinomial(Distribution):
         if jnp.ndim(concentration) < 1:
             raise ValueError("`concentration` parameter must be at least one-dimensional.")
 
-        batch_shape = lax.broadcast_shapes(jnp.shape(concentration)[:-1], jnp.shape(total_count))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(concentration)[:-1], jnp.shape(total_count))
         concentration_shape = batch_shape + jnp.shape(concentration)[-1:]
         self.concentration, = promote_shapes(concentration, shape=concentration_shape)
         self.total_count, = promote_shapes(total_count, shape=batch_shape)
@@ -131,7 +132,7 @@ class DirichletMultinomial(Distribution):
 
     @staticmethod
     def infer_shapes(concentration, total_count=()):
-        batch_shape = lax.broadcast_shapes(concentration[:-1], total_count)
+        batch_shape = jax.lax.broadcast_shapes(concentration[:-1], total_count)
         event_shape = concentration[-1:]
         return batch_shape, event_shape
 

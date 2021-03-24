@@ -3,13 +3,11 @@
 
 from collections import OrderedDict, namedtuple
 
-from jax import grad, jacfwd, random, value_and_grad, vmap
-from jax.flatten_util import ravel_pytree
+import jax
+from jax import random
 import jax.numpy as jnp
-from jax.ops import index_update
 from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import expit
-from jax.tree_util import tree_flatten, tree_map, tree_multimap
 
 import numpyro.distributions as dist
 from numpyro.util import cond, identity, while_loop
@@ -153,7 +151,7 @@ def welford_covariance(diagonal=True):
                 new_state[site_names] = update_fn(sample_block, state_block)
             return new_state
 
-        sample, _ = ravel_pytree(sample)
+        sample, _ = jax.flatten_util.ravel_pytree(sample)
         mean, m2, n = state
         n = n + 1
         delta_pre = sample - mean
@@ -208,16 +206,16 @@ def welford_covariance(diagonal=True):
 
 def _value_and_grad(f, x, forward_mode_differentiation=False):
     if forward_mode_differentiation:
-        return f(x), jacfwd(f)(x)
+        return f(x), jax.jacfwd(f)(x)
     else:
-        return value_and_grad(f)(x)
+        return jax.value_and_grad(f)(x)
 
 
 def _kinetic_grad(kinetic_fn, inverse_mass_matrix, r):
     if hasattr(kinetic_fn, "_kinetic_grad"):
         return kinetic_fn._kinetic_grad(inverse_mass_matrix, r)
     else:
-        return grad(kinetic_fn, argnums=1)(inverse_mass_matrix, r)
+        return jax.grad(kinetic_fn, argnums=1)(inverse_mass_matrix, r)
 
 
 def velocity_verlet(potential_fn, kinetic_fn, forward_mode_differentiation=False):
@@ -253,11 +251,11 @@ def velocity_verlet(potential_fn, kinetic_fn, forward_mode_differentiation=False
         :return: new state for the integrator.
         """
         z, r, _, z_grad = state
-        r = tree_multimap(lambda r, z_grad: r - 0.5 * step_size * z_grad, r, z_grad)  # r(n+1/2)
+        r = jax.tree_util.tree_multimap(lambda r, z_grad: r - 0.5 * step_size * z_grad, r, z_grad)  # r(n+1/2)
         r_grad = _kinetic_grad(kinetic_fn, inverse_mass_matrix, r)
-        z = tree_multimap(lambda z, r_grad: z + step_size * r_grad, z, r_grad)  # z(n+1)
+        z = jax.tree_util.tree_multimap(lambda z, r_grad: z + step_size * r_grad, z, r_grad)  # z(n+1)
         potential_energy, z_grad = _value_and_grad(potential_fn, z, forward_mode_differentiation)
-        r = tree_multimap(lambda r, z_grad: r - 0.5 * step_size * z_grad, r, z_grad)  # r(n+1)
+        r = jax.tree_util.tree_multimap(lambda r, z_grad: r - 0.5 * step_size * z_grad, r, z_grad)  # r(n+1)
         return IntegratorState(z, r, potential_energy, z_grad)
 
     return init_fn, update_fn
@@ -292,7 +290,7 @@ def find_reasonable_step_size(potential_fn, kinetic_fn, momentum_generator,
     _, vv_update = velocity_verlet(potential_fn, kinetic_fn)
     z, _, potential_energy, z_grad = z_info
     if potential_energy is None or z_grad is None:
-        potential_energy, z_grad = value_and_grad(potential_fn)(z)
+        potential_energy, z_grad = jax.value_and_grad(potential_fn)(z)
     finfo = jnp.finfo(jnp.result_type(init_step_size))
 
     def _body_fn(state):
@@ -419,7 +417,7 @@ def _initialize_mass_matrix(z, inverse_mass_matrix, dense_mass):
              " `inverse_mass_matrix` and in `dense_mass` argument.")
         return inverse_mass_matrix, mass_matrix_sqrt, mass_matrix_sqrt_inv
 
-    mass_matrix_size = jnp.size(ravel_pytree(z)[0])
+    mass_matrix_size = jnp.size(jax.flatten_util.ravel_pytree(z)[0])
     if inverse_mass_matrix is None:
         if dense_mass:
             inverse_mass_matrix = jnp.identity(mass_matrix_size)
@@ -580,9 +578,9 @@ def _momentum_angle(inverse_mass_matrix, r_left, r_right, r_sum):
             right_angle = right_angle + right_a
         return left_angle, right_angle
 
-    r_left, _ = ravel_pytree(r_left)
-    r_right, _ = ravel_pytree(r_right)
-    r_sum, _ = ravel_pytree(r_sum)
+    r_left, _ = jax.flatten_util.ravel_pytree(r_left)
+    r_right, _ = jax.flatten_util.ravel_pytree(r_right)
+    r_sum, _ = jax.flatten_util.ravel_pytree(r_sum)
 
     if inverse_mass_matrix.ndim == 2:
         v_left = jnp.matmul(inverse_mass_matrix, r_left)
@@ -636,7 +634,7 @@ def _combine_tree(current_tree, new_tree, inverse_mass_matrix, going_right, rng_
                        trees[0].z_left_grad, trees[1].z_right,
                        trees[1].r_right, trees[1].z_right_grad)
     )
-    r_sum = tree_multimap(jnp.add, current_tree.r_sum, new_tree.r_sum)
+    r_sum = jax.tree_util.tree_multimap(jnp.add, current_tree.r_sum, new_tree.r_sum)
 
     if biased_transition:
         transition_prob = _biased_transition_kernel(current_tree, new_tree)
@@ -774,13 +772,13 @@ def _iterative_build_subtree(prototype_tree, vv_update, kinetic_fn,
         # NB: in the special case leaf_idx=0, ckpt_idx_min=1 and ckpt_idx_max=0,
         # the following logic is still valid for that case
         ckpt_idx_min, ckpt_idx_max = _leaf_idx_to_ckpt_idxs(leaf_idx)
-        r, unravel_fn = ravel_pytree(new_leaf.r_right)
-        r_sum, _ = ravel_pytree(new_tree.r_sum)
+        r, unravel_fn = jax.flatten_util.ravel_pytree(new_leaf.r_right)
+        r_sum, _ = jax.flatten_util.ravel_pytree(new_tree.r_sum)
         # we update checkpoints when leaf_idx is even
         r_ckpts, r_sum_ckpts = cond(leaf_idx % 2 == 0,
                                     (r_ckpts, r_sum_ckpts),
-                                    lambda x: (index_update(x[0], ckpt_idx_max, r),
-                                               index_update(x[1], ckpt_idx_max, r_sum)),
+                                    lambda x: (x[0].at[ckpt_idx_max](r),
+                                               x[1].at[ckpt_idx_max](r_sum)),
                                     (r_ckpts, r_sum_ckpts),
                                     identity)
 
@@ -831,7 +829,7 @@ def build_tree(verlet_update, kinetic_fn, verlet_state, inverse_mass_matrix, ste
     """
     z, r, potential_energy, z_grad = verlet_state
     energy_current = potential_energy + kinetic_fn(inverse_mass_matrix, r)
-    latent_size = jnp.size(ravel_pytree(r)[0])
+    latent_size = jnp.size(jax.flatten_util.ravel_pytree(r)[0])
     r_ckpts = jnp.zeros((max_tree_depth, latent_size))
     r_sum_ckpts = jnp.zeros((max_tree_depth, latent_size))
 
@@ -867,7 +865,7 @@ def euclidean_kinetic_energy(inverse_mass_matrix, r):
             ke = ke + euclidean_kinetic_energy(inverse_mm, r_block)
         return ke
 
-    r, _ = ravel_pytree(r)
+    r, _ = jax.flatten_util.ravel_pytree(r)
 
     if inverse_mass_matrix.ndim == 2:
         v = jnp.matmul(inverse_mass_matrix, r)
@@ -887,7 +885,7 @@ def _euclidean_kinetic_energy_grad(inverse_mass_matrix, r):
             r_grad.update(_euclidean_kinetic_energy_grad(inverse_mm, r_block))
         return r_grad
 
-    r, unravel_fn = ravel_pytree(r)
+    r, unravel_fn = jax.flatten_util.ravel_pytree(r)
 
     if inverse_mass_matrix.ndim == 2:
         v = jnp.matmul(inverse_mass_matrix, r)
@@ -921,33 +919,34 @@ def consensus(subposteriors, num_draws=None, diagonal=False, rng_key=None):
         a collection of `num_draws` samples with the same data structure as each subposterior.
     """
     # stack subposteriors
-    joined_subposteriors = tree_multimap(lambda *args: jnp.stack(args), *subposteriors)
+    joined_subposteriors = jax.tree_util.tree_multimap(lambda *args: jnp.stack(args), *subposteriors)
     # shape of joined_subposteriors: n_subs x n_samples x sample_shape
-    joined_subposteriors = vmap(vmap(lambda sample: ravel_pytree(sample)[0]))(joined_subposteriors)
+    joined_subposteriors = jax.vmap(jax.vmap(
+        lambda sample: jax.flatten_util.ravel_pytree(sample)[0]))(joined_subposteriors)
 
     if num_draws is not None:
         rng_key = random.PRNGKey(0) if rng_key is None else rng_key
         # randomly gets num_draws from subposteriors
         n_subs = len(subposteriors)
-        n_samples = tree_flatten(subposteriors[0])[0][0].shape[0]
+        n_samples = jax.tree_util.tree_flatten(subposteriors[0])[0][0].shape[0]
         # shape of draw_idxs: n_subs x num_draws x sample_shape
         draw_idxs = random.randint(rng_key, shape=(n_subs, num_draws), minval=0, maxval=n_samples)
-        joined_subposteriors = vmap(lambda x, idx: x[idx])(joined_subposteriors, draw_idxs)
+        joined_subposteriors = jax.vmap(lambda x, idx: x[idx])(joined_subposteriors, draw_idxs)
 
     if diagonal:
         # compute weights for each subposterior (ref: Section 3.1 of [1])
-        weights = vmap(lambda x: 1 / jnp.var(x, ddof=1, axis=0))(joined_subposteriors)
+        weights = jax.vmap(lambda x: 1 / jnp.var(x, ddof=1, axis=0))(joined_subposteriors)
         normalized_weights = weights / jnp.sum(weights, axis=0)
         # get weighted samples
         samples_flat = jnp.einsum('ij,ikj->kj', normalized_weights, joined_subposteriors)
     else:
-        weights = vmap(lambda x: jnp.linalg.inv(jnp.cov(x.T)))(joined_subposteriors)
+        weights = jax.vmap(lambda x: jnp.linalg.inv(jnp.cov(x.T)))(joined_subposteriors)
         normalized_weights = jnp.matmul(jnp.linalg.inv(jnp.sum(weights, axis=0)), weights)
         samples_flat = jnp.einsum('ijk,ilk->lj', normalized_weights, joined_subposteriors)
 
     # unravel_fn acts on 1 sample of a subposterior
-    _, unravel_fn = ravel_pytree(tree_map(lambda x: x[0], subposteriors[0]))
-    return vmap(lambda x: unravel_fn(x))(samples_flat)
+    _, unravel_fn = jax.flatten_util.ravel_pytree(jax.tree_util.tree_map(lambda x: x[0], subposteriors[0]))
+    return jax.vmap(lambda x: unravel_fn(x))(samples_flat)
 
 
 def parametric(subposteriors, diagonal=False):
@@ -964,12 +963,12 @@ def parametric(subposteriors, diagonal=False):
         `False` (using covariance).
     :return: the estimated mean and variance/covariance parameters of the joined posterior
     """
-    joined_subposteriors = tree_multimap(lambda *args: jnp.stack(args), *subposteriors)
-    joined_subposteriors = vmap(vmap(lambda sample: ravel_pytree(sample)[0]))(joined_subposteriors)
+    joined_subposteriors = jax.tree_util.tree_multimap(lambda *args: jnp.stack(args), *subposteriors)
+    joined_subposteriors = jax.vmap(jax.vmap(lambda sample: jax.flatten_util.ravel_pytree(sample)[0]))(joined_subposteriors)
 
     submeans = jnp.mean(joined_subposteriors, axis=1)
     if diagonal:
-        weights = vmap(lambda x: 1 / jnp.var(x, ddof=1, axis=0))(joined_subposteriors)
+        weights = jax.vmap(lambda x: 1 / jnp.var(x, ddof=1, axis=0))(joined_subposteriors)
         var = 1 / jnp.sum(weights, axis=0)
         normalized_weights = var * weights
 
@@ -977,7 +976,7 @@ def parametric(subposteriors, diagonal=False):
         mean = jnp.einsum('ij,ij->j', normalized_weights, submeans)
         return mean, var
     else:
-        weights = vmap(lambda x: jnp.linalg.inv(jnp.cov(x.T)))(joined_subposteriors)
+        weights = jax.vmap(lambda x: jnp.linalg.inv(jnp.cov(x.T)))(joined_subposteriors)
         cov = jnp.linalg.inv(jnp.sum(weights, axis=0))
         normalized_weights = jnp.matmul(cov, weights)
 
@@ -1010,5 +1009,5 @@ def parametric_draws(subposteriors, num_draws, diagonal=False, rng_key=None):
         mean, cov = parametric(subposteriors, diagonal=False)
         samples_flat = dist.MultivariateNormal(mean, cov).sample(rng_key, (num_draws,))
 
-    _, unravel_fn = ravel_pytree(tree_map(lambda x: x[0], subposteriors[0]))
-    return vmap(lambda x: unravel_fn(x))(samples_flat)
+    _, unravel_fn = jax.flatten_util.ravel_pytree(jax.tree_util.tree_map(lambda x: x[0], subposteriors[0]))
+    return jax.vmap(lambda x: unravel_fn(x))(samples_flat)

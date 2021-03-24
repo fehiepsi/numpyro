@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import OrderedDict, namedtuple
+from functools import partial
 import math
 import os
 
-from jax import device_put, lax, partial, random, vmap
-from jax.flatten_util import ravel_pytree
+import jax
+from jax import random
 import jax.numpy as jnp
 
 from numpyro.infer.hmc_util import (
@@ -75,7 +76,7 @@ def momentum_generator(prototype_r, mass_matrix_sqrt, rng_key):
             r.update(momentum_generator(r_block, mm_sqrt, rng_key))
         return r
 
-    _, unpack_fn = ravel_pytree(prototype_r)
+    _, unpack_fn = jax.flatten_util.ravel_pytree(prototype_r)
     eps = random.normal(rng_key, jnp.shape(mass_matrix_sqrt)[:1])
     if mass_matrix_sqrt.ndim == 1:
         r = jnp.multiply(mass_matrix_sqrt, eps)
@@ -239,8 +240,8 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
             randomness.
 
         """
-        step_size = lax.convert_element_type(step_size, jnp.result_type(float))
-        trajectory_length = lax.convert_element_type(trajectory_length, jnp.result_type(float))
+        step_size = jax.lax.convert_element_type(step_size, jnp.result_type(float))
+        trajectory_length = jax.lax.convert_element_type(trajectory_length, jnp.result_type(float))
         nonlocal wa_update, max_treedepth, vv_update, wa_steps, forward_mode_ad
         forward_mode_ad = forward_mode_differentiation
         wa_steps = num_warmup
@@ -283,7 +284,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
         hmc_state = HMCState(zero_int, vv_state.z, vv_state.z_grad, vv_state.potential_energy, energy,
                              None, trajectory_length,
                              zero_int, jnp.zeros(()), jnp.zeros(()), jnp.array(False), wa_state, rng_key_hmc)
-        return device_put(hmc_state)
+        return hmc_state
 
     def _hmc_next(step_size, inverse_mass_matrix, vv_state,
                   model_args, model_kwargs, rng_key, trajectory_length):
@@ -540,7 +541,7 @@ class HMC(MCMCKernel):
             rng_key, rng_key_init_model = random.split(rng_key)
         # vectorized
         else:
-            rng_key, rng_key_init_model = jnp.swapaxes(vmap(random.split)(rng_key), 0, 1)
+            rng_key, rng_key_init_model = jnp.swapaxes(jax.vmap(random.split)(rng_key), 0, 1)
         init_params = self._init_state(rng_key_init_model, model_args, model_kwargs, init_params)
         if self._potential_fn and init_params is None:
             raise ValueError('Valid value of `init_params` must be provided with'
@@ -581,8 +582,8 @@ class HMC(MCMCKernel):
             # XXX it is safe to run hmc_init_fn under vmap despite that hmc_init_fn changes some
             # nonlocal variables: momentum_generator, wa_update, trajectory_len, max_treedepth,
             # wa_steps because those variables do not depend on traced args: init_params, rng_key.
-            init_state = vmap(hmc_init_fn)(init_params, rng_key)
-            sample_fn = vmap(self._sample_fn, in_axes=(0, None, None))
+            init_state = jax.vmap(hmc_init_fn)(init_params, rng_key)
+            sample_fn = jax.vmap(self._sample_fn, in_axes=(0, None, None))
             self._sample_fn = sample_fn
         return init_state
 

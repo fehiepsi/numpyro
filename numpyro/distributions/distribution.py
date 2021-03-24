@@ -33,7 +33,7 @@ import warnings
 
 import numpy as np
 
-from jax import lax, tree_util
+import jax
 import jax.numpy as jnp
 
 from numpyro.distributions.transforms import ComposeTransform, Transform
@@ -131,9 +131,9 @@ class Distribution(metaclass=DistributionMeta):
     # ref: https://github.com/google/jax/issues/2916
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        tree_util.register_pytree_node(cls,
-                                       cls.tree_flatten,
-                                       cls.tree_unflatten)
+        jax.tree_util.register_pytree_node(cls,
+                                           cls.tree_flatten,
+                                           cls.tree_unflatten)
 
     def tree_flatten(self):
         return tuple(getattr(self, param) for param in sorted(self.arg_constraints.keys())), None
@@ -423,7 +423,7 @@ class Distribution(metaclass=DistributionMeta):
         for name, shape in kwargs.items():
             event_dim = cls.arg_constraints.get(name, constraints.real).event_dim
             batch_shapes.append(shape[:len(shape) - event_dim])
-        batch_shape = lax.broadcast_shapes(*batch_shapes) if batch_shapes else ()
+        batch_shape = jax.lax.broadcast_shapes(*batch_shapes) if batch_shapes else ()
         event_shape = ()
         return batch_shape, event_shape
 
@@ -514,7 +514,7 @@ class ExpandedDistribution(Distribution):
             event_shape = subshape[len(self.base_dist.batch_shape):]
             return x.reshape(sample_shape + self.batch_shape + event_shape)
 
-        intermediates = tree_util.tree_map(reshape_sample, intermediates)
+        intermediates = jax.tree_util.tree_map(reshape_sample, intermediates)
         samples = reshape_sample(samples)
         return samples, intermediates
 
@@ -535,7 +535,7 @@ class ExpandedDistribution(Distribution):
         return self.sample_with_intermediates(key, sample_shape)[0]
 
     def log_prob(self, value):
-        shape = lax.broadcast_shapes(self.batch_shape,
+        shape = jax.lax.broadcast_shapes(self.batch_shape,
                                      jnp.shape(value)[:max(jnp.ndim(value) - self.event_dim, 0)])
         log_prob = self.base_dist.log_prob(value)
         return jnp.broadcast_to(log_prob, shape)
@@ -558,7 +558,7 @@ class ExpandedDistribution(Distribution):
 
     def tree_flatten(self):
         prepend_ndim = len(self.batch_shape) - len(self.base_dist.batch_shape)
-        base_dist = tree_util.tree_map(
+        base_dist = jax.tree_util.tree_map(
             lambda x: promote_shapes(x, shape=(1,) * prepend_ndim + jnp.shape(x))[0],
             self.base_dist)
         base_flatten, base_aux = base_dist.tree_flatten()
@@ -632,7 +632,7 @@ class ImproperUniform(Distribution):
     @validate_sample
     def log_prob(self, value):
         batch_shape = jnp.shape(value)[:jnp.ndim(value) - len(self.event_shape)]
-        batch_shape = lax.broadcast_shapes(batch_shape, self.batch_shape)
+        batch_shape = jax.lax.broadcast_shapes(batch_shape, self.batch_shape)
         return jnp.zeros(batch_shape)
 
     def _validate_sample(self, value):
@@ -757,7 +757,7 @@ class MaskedDistribution(Distribution):
         if isinstance(mask, bool):
             self._mask = mask
         else:
-            batch_shape = lax.broadcast_shapes(jnp.shape(mask), tuple(base_dist.batch_shape))
+            batch_shape = jax.lax.broadcast_shapes(jnp.shape(mask), tuple(base_dist.batch_shape))
             if mask.shape != batch_shape:
                 mask = jnp.broadcast_to(mask, batch_shape)
             if base_dist.batch_shape != batch_shape:
@@ -790,7 +790,7 @@ class MaskedDistribution(Distribution):
 
     def log_prob(self, value):
         if self._mask is False:
-            shape = lax.broadcast_shapes(tuple(self.base_dist.batch_shape),
+            shape = jax.lax.broadcast_shapes(tuple(self.base_dist.batch_shape),
                                          jnp.shape(value)[:max(jnp.ndim(value) - len(self.event_shape), 0)])
             return jnp.zeros(shape)
         if self._mask is True:
@@ -1029,5 +1029,5 @@ class Unit(Distribution):
         return jnp.empty(sample_shape + self.batch_shape + self.event_shape)
 
     def log_prob(self, value):
-        shape = lax.broadcast_shapes(self.batch_shape, jnp.shape(value)[:-1])
+        shape = jax.lax.broadcast_shapes(self.batch_shape, jnp.shape(value)[:-1])
         return jnp.broadcast_to(self.log_factor, shape)

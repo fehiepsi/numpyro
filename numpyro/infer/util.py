@@ -7,8 +7,8 @@ import warnings
 
 import numpy as np
 
-from jax import device_get, jacfwd, lax, random, value_and_grad
-from jax.flatten_util import ravel_pytree
+import jax
+from jax import random
 import jax.numpy as jnp
 
 import numpyro
@@ -241,10 +241,10 @@ def find_valid_initial_params(rng_key, model,
         potential_fn = partial(potential_energy, model, model_args, model_kwargs, enum=enum)
         if forward_mode_differentiation:
             pe = potential_fn(params)
-            z_grad = jacfwd(potential_fn)(params)
+            z_grad = jax.jacfwd(potential_fn)(params)
         else:
-            pe, z_grad = value_and_grad(potential_fn)(params)
-        z_grad_flat = ravel_pytree(z_grad)[0]
+            pe, z_grad = jax.value_and_grad(potential_fn)(params)
+        z_grad_flat = jax.tree_util.ravel_pytree(z_grad)[0]
         is_valid = jnp.isfinite(pe) & jnp.all(jnp.isfinite(z_grad_flat))
         return i + 1, key, (params, pe, z_grad), is_valid
 
@@ -255,7 +255,7 @@ def find_valid_initial_params(rng_key, model,
             # where we can avoid compiling body_fn in while_loop.
             _, _, (init_params, pe, z_grad), is_valid = init_state = body_fn(init_state)
             if not_jax_tracer(is_valid):
-                if device_get(is_valid):
+                if jax.device_get(is_valid):
                     return (init_params, pe, z_grad), is_valid
 
         # XXX: this requires compiling the model, so for multi-chain, we trace the model 2-times
@@ -267,7 +267,7 @@ def find_valid_initial_params(rng_key, model,
     if rng_key.ndim == 1:
         (init_params, pe, z_grad), is_valid = _find_valid_params(rng_key, exit_early=True)
     else:
-        (init_params, pe, z_grad), is_valid = lax.map(_find_valid_params, rng_key)
+        (init_params, pe, z_grad), is_valid = jax.lax.map(_find_valid_params, rng_key)
     return (init_params, pe, z_grad), is_valid
 
 
@@ -468,7 +468,7 @@ def initialize_model(rng_key, model,
         forward_mode_differentiation=forward_mode_differentiation)
 
     if not_jax_tracer(is_valid):
-        if device_get(~jnp.all(is_valid)):
+        if jax.device_get(~jnp.all(is_valid)):
             with numpyro.validation_enabled(), trace() as tr:
                 # validate parameters
                 substituted_model(*model_args, **model_kwargs)

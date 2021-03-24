@@ -1,7 +1,7 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from jax import lax
+import jax
 import jax.numpy as jnp
 
 from numpyro.distributions.constraints import real_vector
@@ -10,7 +10,7 @@ from numpyro.util import fori_loop
 
 
 def _clamp_preserve_gradients(x, min, max):
-    return x + lax.stop_gradient(jnp.clip(x, a_min=min, a_max=max) - x)
+    return x + jax.lax.stop_gradient(jnp.clip(x, a_min=min, a_max=max) - x)
 
 
 # adapted from https://github.com/pyro-ppl/pyro/blob/dev/pyro/distributions/transforms/iaf.py

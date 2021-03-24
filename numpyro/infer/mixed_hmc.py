@@ -4,7 +4,8 @@
 from collections import namedtuple
 from functools import partial
 
-from jax import grad, jacfwd, lax, ops, random
+import jax
+from jax import random
 import jax.numpy as jnp
 
 from numpyro.infer.hmc import momentum_generator
@@ -112,8 +113,8 @@ class MixedHMC(DiscreteHMCGibbs):
             # the discrete variable and its corresponding kinetic energy. In case of
             # refract, we will need to update the potential energy and its grad w.r.t. hmc_state.z
             ke_discrete_i_new = ke_discrete[idx] + log_accept_ratio
-            grad_ = jacfwd if self.inner_kernel._forward_mode_differentiation else grad
-            z_discrete, pe, ke_discrete_i, z_grad = lax.cond(
+            grad_ = jax.jacfwd if self.inner_kernel._forward_mode_differentiation else jax.grad
+            z_discrete, pe, ke_discrete_i, z_grad = jax.lax.cond(
                 ke_discrete_i_new > 0,
                 (z_discrete_new, pe_new, ke_discrete_i_new),
                 lambda vals: vals + (grad_(partial(potential_fn, vals[0]))(hmc_state.z),),
@@ -121,7 +122,7 @@ class MixedHMC(DiscreteHMCGibbs):
                 identity)
 
             delta_pe_sum = delta_pe_sum + pe - hmc_state.potential_energy
-            ke_discrete = ops.index_update(ke_discrete, idx, ke_discrete_i)
+            ke_discrete = ke_discrete.at[idx].set(ke_discrete_i)
             hmc_state = hmc_state._replace(potential_energy=pe, z_grad=z_grad)
             return rng_key, hmc_state, z_discrete, ke_discrete, delta_pe_sum
 
@@ -145,7 +146,7 @@ class MixedHMC(DiscreteHMCGibbs):
             # (see the note at total_time below)
             trajectory_length = arrival_times[idx] * time_unit
             arrival_times = arrival_times - arrival_times[idx]
-            arrival_times = ops.index_update(arrival_times, idx, 1.)
+            arrival_times = arrival_times.at[idx].set(1.)
 
             # this is a trick, so that in a sub-trajectory of HMC, we always accept the new proposal
             pe = jnp.inf

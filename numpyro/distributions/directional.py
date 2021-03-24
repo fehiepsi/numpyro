@@ -3,9 +3,9 @@
 
 import math
 
-from jax import lax
+import jax
+from jax import random
 import jax.numpy as jnp
-import jax.random as random
 from jax.scipy.special import erf, i0e, i1e
 
 from numpyro.distributions import constraints
@@ -26,7 +26,7 @@ class VonMises(Distribution):
         """
         self.loc, self.concentration = promote_shapes(loc, concentration)
 
-        batch_shape = lax.broadcast_shapes(jnp.shape(concentration), jnp.shape(loc))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(concentration), jnp.shape(loc))
 
         super(VonMises, self).__init__(batch_shape=batch_shape,
                                        validate_args=validate_args)

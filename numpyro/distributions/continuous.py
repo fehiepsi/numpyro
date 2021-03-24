@@ -26,10 +26,9 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 
-from jax import lax, ops, tree_map
-import jax.nn as nn
+import jax
+from jax import random
 import jax.numpy as jnp
-import jax.random as random
 from jax.scipy.linalg import cho_solve, solve_triangular
 from jax.scipy.special import betainc, expit, gammaln, logit, logsumexp, multigammaln, ndtr, ndtri
 
@@ -57,7 +56,7 @@ class Beta(Distribution):
 
     def __init__(self, concentration1, concentration0, validate_args=None):
         self.concentration1, self.concentration0 = promote_shapes(concentration1, concentration0)
-        batch_shape = lax.broadcast_shapes(jnp.shape(concentration1), jnp.shape(concentration0))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(concentration1), jnp.shape(concentration0))
         concentration1 = jnp.broadcast_to(concentration1, batch_shape)
         concentration0 = jnp.broadcast_to(concentration0, batch_shape)
         self._dirichlet = Dirichlet(jnp.stack([concentration1, concentration0],
@@ -92,7 +91,7 @@ class Cauchy(Distribution):
 
     def __init__(self, loc=0., scale=1., validate_args=None):
         self.loc, self.scale = promote_shapes(loc, scale)
-        batch_shape = lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
         super(Cauchy, self).__init__(batch_shape=batch_shape, validate_args=validate_args)
 
     def sample(self, key, sample_shape=()):
@@ -147,7 +146,7 @@ class Dirichlet(Distribution):
         # and apply softmax to get a dirichlet sample
         gamma_samples = random.gamma(key_gamma, self.concentration + 1, shape=shape)
         expon_samples = random.exponential(key_expon, shape=shape)
-        samples = nn.softmax(jnp.log(gamma_samples) - expon_samples / self.concentration, -1)
+        samples = jax.nn.softmax(jnp.log(gamma_samples) - expon_samples / self.concentration, -1)
         return jnp.clip(samples, a_min=jnp.finfo(samples).tiny, a_max=1 - jnp.finfo(samples).eps)
 
     @validate_sample
@@ -206,7 +205,7 @@ class Gamma(Distribution):
 
     def __init__(self, concentration, rate=1., validate_args=None):
         self.concentration, self.rate = promote_shapes(concentration, rate)
-        batch_shape = lax.broadcast_shapes(jnp.shape(concentration), jnp.shape(rate))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(concentration), jnp.shape(rate))
         super(Gamma, self).__init__(batch_shape=batch_shape,
                                     validate_args=validate_args)
 
@@ -376,7 +375,7 @@ class Gumbel(Distribution):
 
     def __init__(self, loc=0., scale=1., validate_args=None):
         self.loc, self.scale = promote_shapes(loc, scale)
-        batch_shape = lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
 
         super(Gumbel, self).__init__(batch_shape=batch_shape,
                                      validate_args=validate_args)
@@ -409,7 +408,7 @@ class Laplace(Distribution):
 
     def __init__(self, loc=0., scale=1., validate_args=None):
         self.loc, self.scale = promote_shapes(loc, scale)
-        batch_shape = lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
         super(Laplace, self).__init__(batch_shape=batch_shape, validate_args=validate_args)
 
     def sample(self, key, sample_shape=()):
@@ -595,8 +594,7 @@ class LKJCholesky(Distribution):
         w = jnp.expand_dims(jnp.sqrt(beta_sample), axis=-1) * u_hypershere
 
         # put w into the off-diagonal triangular part
-        cholesky = ops.index_add(jnp.zeros(size + self.batch_shape + self.event_shape),
-                                 ops.index[..., 1:, :-1], w)
+        cholesky = jnp.zeros(size + self.batch_shape + self.event_shape).at[..., 1:, :-1].add(w)
         # correct the diagonal
         # NB: we clip due to numerical precision
         diag = jnp.sqrt(jnp.clip(1 - jnp.sum(cholesky ** 2, axis=-1), a_min=0.))
@@ -693,7 +691,7 @@ class Logistic(Distribution):
 
     def __init__(self, loc=0., scale=1., validate_args=None):
         self.loc, self.scale = promote_shapes(loc, scale)
-        batch_shape = lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
         super(Logistic, self).__init__(batch_shape, validate_args=validate_args)
 
     def sample(self, key, sample_shape=()):
@@ -704,7 +702,7 @@ class Logistic(Distribution):
     @validate_sample
     def log_prob(self, value):
         log_exponent = (self.loc - value) / self.scale
-        log_denominator = jnp.log(self.scale) + 2 * nn.softplus(log_exponent)
+        log_denominator = jnp.log(self.scale) + 2 * jax.nn.softplus(log_exponent)
         return log_exponent - log_denominator
 
     @property
@@ -793,7 +791,7 @@ class MultivariateNormal(Distribution):
         else:
             raise ValueError('One of `covariance_matrix`, `precision_matrix`, `scale_tril`'
                              ' must be specified.')
-        batch_shape = lax.broadcast_shapes(jnp.shape(loc)[:-2], jnp.shape(self.scale_tril)[:-2])
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(loc)[:-2], jnp.shape(self.scale_tril)[:-2])
         event_shape = jnp.shape(self.scale_tril)[-1:]
         self.loc = loc[..., 0]
         super(MultivariateNormal, self).__init__(batch_shape=batch_shape,
@@ -843,8 +841,8 @@ class MultivariateNormal(Distribution):
         batch_shape, event_shape = loc[:-1], loc[-1:]
         for matrix in [covariance_matrix, precision_matrix, scale_tril]:
             if matrix is not None:
-                batch_shape = lax.broadcast_shapes(batch_shape, matrix[:-2])
-                event_shape = lax.broadcast_shapes(event_shape, matrix[-1:])
+                batch_shape = jax.lax.broadcast_shapes(batch_shape, matrix[:-2])
+                event_shape = jax.lax.broadcast_shapes(event_shape, matrix[-1:])
         return batch_shape, event_shape
 
 
@@ -918,7 +916,7 @@ class LowRankMultivariateNormal(Distribution):
             raise ValueError("`cov_diag` must be a batch of vectors with shape {}".format(self.event_shape))
 
         loc, cov_factor, cov_diag = promote_shapes(loc[..., jnp.newaxis], cov_factor, cov_diag[..., jnp.newaxis])
-        batch_shape = lax.broadcast_shapes(jnp.shape(loc), jnp.shape(cov_factor), jnp.shape(cov_diag))[:-2]
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(loc), jnp.shape(cov_factor), jnp.shape(cov_diag))[:-2]
         self.loc = loc[..., 0]
         self.cov_factor = cov_factor
         cov_diag = cov_diag[..., 0]
@@ -1006,7 +1004,7 @@ class LowRankMultivariateNormal(Distribution):
     @staticmethod
     def infer_shapes(loc, cov_factor, cov_diag):
         event_shape = loc[-1:]
-        batch_shape = lax.broadcast_shapes(loc[:-1], cov_factor[:-2], cov_diag[:-1])
+        batch_shape = jax.lax.broadcast_shapes(loc[:-1], cov_factor[:-2], cov_diag[:-1])
         return batch_shape, event_shape
 
 
@@ -1017,7 +1015,7 @@ class Normal(Distribution):
 
     def __init__(self, loc=0., scale=1., validate_args=None):
         self.loc, self.scale = promote_shapes(loc, scale)
-        batch_shape = lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale))
         super(Normal, self).__init__(batch_shape=batch_shape, validate_args=validate_args)
 
     def sample(self, key, sample_shape=()):
@@ -1053,7 +1051,7 @@ class Pareto(TransformedDistribution):
 
     def __init__(self, scale, alpha, validate_args=None):
         self.scale, self.alpha = promote_shapes(scale, alpha)
-        batch_shape = lax.broadcast_shapes(jnp.shape(scale), jnp.shape(alpha))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(scale), jnp.shape(alpha))
         scale, alpha = jnp.broadcast_to(scale, batch_shape), jnp.broadcast_to(alpha, batch_shape)
         base_dist = Exponential(alpha)
         transforms = [ExpTransform(), AffineTransform(loc=0, scale=scale)]
@@ -1086,7 +1084,7 @@ class StudentT(Distribution):
     reparametrized_params = ['df', 'loc', 'scale']
 
     def __init__(self, df, loc=0., scale=1., validate_args=None):
-        batch_shape = lax.broadcast_shapes(jnp.shape(df), jnp.shape(loc), jnp.shape(scale))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(df), jnp.shape(loc), jnp.shape(scale))
         self.df, self.loc, self.scale = promote_shapes(df, loc, scale, shape=batch_shape)
         df = jnp.broadcast_to(df, batch_shape)
         self._chi2 = Chi2(df)
@@ -1144,8 +1142,8 @@ class LeftTruncatedDistribution(Distribution):
         assert isinstance(base_dist, self.supported_types)
         assert base_dist.support is constraints.real, \
             "The base distribution should be univariate and have real support."
-        batch_shape = lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(low))
-        self.base_dist = tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
+        batch_shape = jax.lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(low))
+        self.base_dist = jax.tree_util.tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
         self.low, = promote_shapes(low, shape=batch_shape)
         self._support = constraints.greater_than(low)
         super().__init__(batch_shape, validate_args=validate_args)
@@ -1208,8 +1206,8 @@ class RightTruncatedDistribution(Distribution):
         assert isinstance(base_dist, self.supported_types)
         assert base_dist.support is constraints.real, \
             "The base distribution should be univariate and have real support."
-        batch_shape = lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(high))
-        self.base_dist = tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
+        batch_shape = jax.lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(high))
+        self.base_dist = jax.tree_util.tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
         self.high, = promote_shapes(high, shape=batch_shape)
         self._support = constraints.less_than(high)
         super().__init__(batch_shape, validate_args=validate_args)
@@ -1259,8 +1257,8 @@ class TwoSidedTruncatedDistribution(Distribution):
         assert isinstance(base_dist, self.supported_types)
         assert base_dist.support is constraints.real, \
             "The base distribution should be univariate and have real support."
-        batch_shape = lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(low), jnp.shape(high))
-        self.base_dist = tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
+        batch_shape = jax.lax.broadcast_shapes(base_dist.batch_shape, jnp.shape(low), jnp.shape(high))
+        self.base_dist = jax.tree_util.tree_map(lambda p: promote_shapes(p, shape=batch_shape)[0], base_dist)
         self.low, = promote_shapes(low, shape=batch_shape)
         self.high, = promote_shapes(high, shape=batch_shape)
         self._support = constraints.interval(low, high)
@@ -1427,7 +1425,7 @@ class Uniform(Distribution):
 
     def __init__(self, low=0., high=1., validate_args=None):
         self.low, self.high = promote_shapes(low, high)
-        batch_shape = lax.broadcast_shapes(jnp.shape(low), jnp.shape(high))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(low), jnp.shape(high))
         self._support = constraints.interval(low, high)
         super().__init__(batch_shape, validate_args=validate_args)
 
@@ -1441,7 +1439,7 @@ class Uniform(Distribution):
 
     @validate_sample
     def log_prob(self, value):
-        shape = lax.broadcast_shapes(jnp.shape(value), self.batch_shape)
+        shape = jax.lax.broadcast_shapes(jnp.shape(value), self.batch_shape)
         return - jnp.broadcast_to(jnp.log(self.high - self.low), shape)
 
     @property
@@ -1469,7 +1467,7 @@ class Uniform(Distribution):
 
     @staticmethod
     def infer_shapes(low=(), high=()):
-        batch_shape = lax.broadcast_shapes(low, high)
+        batch_shape = jax.lax.broadcast_shapes(low, high)
         event_shape = ()
         return batch_shape, event_shape
 

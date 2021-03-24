@@ -7,9 +7,7 @@ import weakref
 
 import numpy as np
 
-from jax import lax, ops, tree_flatten, tree_map, vmap
-from jax.flatten_util import ravel_pytree
-from jax.nn import softplus
+import jax
 import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import expit, logit
@@ -188,14 +186,14 @@ class AffineTransform(Transform):
         return jnp.broadcast_to(jnp.log(jnp.abs(self.scale)), jnp.shape(x))
 
     def forward_shape(self, shape):
-        return lax.broadcast_shapes(shape,
-                                    getattr(self.loc, "shape", ()),
-                                    getattr(self.scale, "shape", ()))
+        return jax.lax.broadcast_shapes(shape,
+                                        getattr(self.loc, "shape", ()),
+                                        getattr(self.scale, "shape", ()))
 
     def inverse_shape(self, shape):
-        return lax.broadcast_shapes(shape,
-                                    getattr(self.loc, "shape", ()),
-                                    getattr(self.scale, "shape", ()))
+        return jax.lax.broadcast_shapes(shape,
+                                        getattr(self.loc, "shape", ()),
+                                        getattr(self.scale, "shape", ()))
 
 
 def _get_compose_transform_input_event_dim(parts):
@@ -393,7 +391,7 @@ class CorrCholeskyTransform(Transform):
         z1m_cumprod_tril = matrix_to_tril_vec(z1m_cumprod, diagonal=-2)
         stick_breaking_logdet = 0.5 * jnp.sum(jnp.log(z1m_cumprod_tril), axis=-1)
 
-        tanh_logdet = -2 * jnp.sum(x + softplus(-2 * x) - jnp.log(2.), axis=-1)
+        tanh_logdet = -2 * jnp.sum(x + jax.nn.softplus(-2 * x) - jnp.log(2.), axis=-1)
         return stick_breaking_logdet + tanh_logdet
 
     def forward_shape(self, shape):
@@ -577,12 +575,12 @@ class LowerCholeskyAffine(Transform):
     def forward_shape(self, shape):
         if len(shape) < 1:
             raise ValueError("Too few dimensions on input")
-        return lax.broadcast_shapes(shape, self.loc.shape, self.scale_tril.shape[:-1])
+        return jax.lax.broadcast_shapes(shape, self.loc.shape, self.scale_tril.shape[:-1])
 
     def inverse_shape(self, shape):
         if len(shape) < 1:
             raise ValueError("Too few dimensions on input")
-        return lax.broadcast_shapes(shape, self.loc.shape, self.scale_tril.shape[:-1])
+        return jax.lax.broadcast_shapes(shape, self.loc.shape, self.scale_tril.shape[:-1])
 
 
 class LowerCholeskyTransform(Transform):
@@ -647,9 +645,8 @@ class PermuteTransform(Transform):
 
     def _inverse(self, y):
         size = self.permutation.size
-        permutation_inv = ops.index_update(jnp.zeros(size, dtype=jnp.result_type(int)),
-                                           self.permutation,
-                                           jnp.arange(size))
+        permutation_inv = jnp.zeros(size, dtype=jnp.result_type(int)).at[
+            self.permutation].set(jnp.arange(size))
         return y[..., permutation_inv]
 
     def log_abs_det_jacobian(self, x, y, intermediates=None):
@@ -673,10 +670,10 @@ class PowerTransform(Transform):
         return jnp.log(jnp.abs(self.exponent * y / x))
 
     def forward_shape(self, shape):
-        return lax.broadcast_shapes(shape, getattr(self.exponent, "shape", ()))
+        return jax.lax.broadcast_shapes(shape, getattr(self.exponent, "shape", ()))
 
     def inverse_shape(self, shape):
-        return lax.broadcast_shapes(shape, getattr(self.exponent, "shape", ()))
+        return jax.lax.broadcast_shapes(shape, getattr(self.exponent, "shape", ()))
 
 
 class SigmoidTransform(Transform):
@@ -706,13 +703,13 @@ class SoftplusTransform(Transform):
     codomain = constraints.softplus_positive
 
     def __call__(self, x):
-        return softplus(x)
+        return jax.nn.softplus(x)
 
     def _inverse(self, y):
         return _softplus_inv(y)
 
     def log_abs_det_jacobian(self, x, y, intermediates=None):
-        return -softplus(-x)
+        return -jax.nn.softplus(-x)
 
 
 class SoftplusLowerCholeskyTransform(Transform):
@@ -727,7 +724,7 @@ class SoftplusLowerCholeskyTransform(Transform):
     def __call__(self, x):
         n = round((math.sqrt(1 + 8 * x.shape[-1]) - 1) / 2)
         z = vec_to_tril_matrix(x[..., :-n], diagonal=-1)
-        diag = softplus(x[..., -n:])
+        diag = jax.nn.softplus(x[..., -n:])
         return z + jnp.expand_dims(diag, axis=-1) * jnp.identity(n)
 
     def _inverse(self, y):
@@ -738,7 +735,7 @@ class SoftplusLowerCholeskyTransform(Transform):
     def log_abs_det_jacobian(self, x, y, intermediates=None):
         # the jacobian is diagonal, so logdet is the sum of diagonal `exp` transform
         n = round((math.sqrt(1 + 8 * x.shape[-1]) - 1) / 2)
-        return -softplus(-x[..., -n:]).sum(-1)
+        return -jax.nn.softplus(-x[..., -n:]).sum(-1)
 
     def forward_shape(self, shape):
         return _matrix_forward_shape(shape)
@@ -807,20 +804,20 @@ class UnpackTransform(Transform):
     def __call__(self, x):
         batch_shape = x.shape[:-1]
         if batch_shape:
-            unpacked = vmap(self.unpack_fn)(x.reshape((-1,) + x.shape[-1:]))
-            return tree_map(lambda z: jnp.reshape(z, batch_shape + z.shape[1:]), unpacked)
+            unpacked = jax.vmap(self.unpack_fn)(x.reshape((-1,) + x.shape[-1:]))
+            return jax.tree_util.tree_map(lambda z: jnp.reshape(z, batch_shape + z.shape[1:]), unpacked)
         else:
             return self.unpack_fn(x)
 
     def _inverse(self, y):
         leading_dims = [v.shape[0] if jnp.ndim(v) > 0 else 0
-                        for v in tree_flatten(y)[0]]
+                        for v in jax.tree_util.tree_flatten(y)[0]]
         d0 = leading_dims[0]
         not_scalar = d0 > 0 or len(leading_dims) > 1
         if not_scalar and all(d == d0 for d in leading_dims[1:]):
             warnings.warn("UnpackTransform.inv might lead to an unexpected behavior because it"
                           " cannot transform a batch of unpacked arrays.")
-        return ravel_pytree(y)[0]
+        return jax.flatten_util.ravel_pytree(y)[0]
 
     def log_abs_det_jacobian(self, x, y, intermediates=None):
         return jnp.zeros(jnp.shape(x)[:-1])

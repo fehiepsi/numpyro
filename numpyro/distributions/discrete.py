@@ -29,10 +29,9 @@ import warnings
 
 import numpy as np
 
-from jax import device_put, lax
-from jax.nn import softmax, softplus
+import jax
+from jax import random
 import jax.numpy as jnp
-import jax.random as random
 from jax.scipy.special import expit, gammaln, logsumexp, xlog1py, xlogy
 
 from numpyro.distributions import constraints
@@ -61,7 +60,7 @@ def _to_logits_bernoulli(probs):
 
 
 def _to_probs_multinom(logits):
-    return softmax(logits, axis=-1)
+    return jax.nn.softmax(logits, axis=-1)
 
 
 def _to_logits_multinom(probs):
@@ -162,7 +161,7 @@ class BinomialProbs(Distribution):
 
     def __init__(self, probs, total_count=1, validate_args=None):
         self.probs, self.total_count = promote_shapes(probs, total_count)
-        batch_shape = lax.broadcast_shapes(jnp.shape(probs), jnp.shape(total_count))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(probs), jnp.shape(total_count))
         super(BinomialProbs, self).__init__(batch_shape=batch_shape, validate_args=validate_args)
 
     def sample(self, key, sample_shape=()):
@@ -217,7 +216,7 @@ class BinomialLogits(Distribution):
 
     def __init__(self, logits, total_count=1, validate_args=None):
         self.logits, self.total_count = promote_shapes(logits, total_count)
-        batch_shape = lax.broadcast_shapes(jnp.shape(logits), jnp.shape(total_count))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(logits), jnp.shape(total_count))
         super(BinomialLogits, self).__init__(batch_shape=batch_shape, validate_args=validate_args)
 
     def sample(self, key, sample_shape=()):
@@ -278,7 +277,7 @@ class CategoricalProbs(Distribution):
 
     @validate_sample
     def log_prob(self, value):
-        batch_shape = lax.broadcast_shapes(jnp.shape(value), self.batch_shape)
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(value), self.batch_shape)
         value = jnp.expand_dims(value, axis=-1)
         value = jnp.broadcast_to(value, batch_shape + (1,))
         logits = self.logits
@@ -326,7 +325,7 @@ class CategoricalLogits(Distribution):
 
     @validate_sample
     def log_prob(self, value):
-        batch_shape = lax.broadcast_shapes(jnp.shape(value), self.batch_shape)
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(value), self.batch_shape)
         value = jnp.expand_dims(value, -1)
         value = jnp.broadcast_to(value, batch_shape + (1,))
         log_pmf = self.logits - logsumexp(self.logits, axis=-1, keepdims=True)
@@ -397,7 +396,7 @@ class OrderedLogistic(CategoricalProbs):
 
     @staticmethod
     def infer_shapes(predictor, cutpoints):
-        batch_shape = lax.broadcast_shapes(predictor, cutpoints[:-1])
+        batch_shape = jax.lax.broadcast_shapes(predictor, cutpoints[:-1])
         event_shape = ()
         return batch_shape, event_shape
 
@@ -465,7 +464,7 @@ class MultinomialProbs(Distribution):
 
     @staticmethod
     def infer_shapes(probs, total_count):
-        batch_shape = lax.broadcast_shapes(probs[:-1], total_count)
+        batch_shape = jax.lax.broadcast_shapes(probs[:-1], total_count)
         event_shape = probs[-1:]
         return batch_shape, event_shape
 
@@ -515,7 +514,7 @@ class MultinomialLogits(Distribution):
 
     @staticmethod
     def infer_shapes(logits, total_count):
-        batch_shape = lax.broadcast_shapes(logits[:-1], total_count)
+        batch_shape = jax.lax.broadcast_shapes(logits[:-1], total_count)
         event_shape = logits[-1:]
         return batch_shape, event_shape
 
@@ -569,7 +568,7 @@ class ZeroInflatedPoisson(Distribution):
     is_discrete = True
 
     def __init__(self, gate, rate=1., validate_args=None):
-        batch_shape = lax.broadcast_shapes(jnp.shape(gate), jnp.shape(rate))
+        batch_shape = jax.lax.broadcast_shapes(jnp.shape(gate), jnp.shape(rate))
         self.gate, self.rate = promote_shapes(gate, rate)
         super(ZeroInflatedPoisson, self).__init__(batch_shape, validate_args=validate_args)
 
@@ -578,7 +577,7 @@ class ZeroInflatedPoisson(Distribution):
         key_bern, key_poisson = random.split(key)
         shape = sample_shape + self.batch_shape
         mask = random.bernoulli(key_bern, self.gate, shape)
-        samples = random.poisson(key_poisson, device_put(self.rate), shape)
+        samples = random.poisson(key_poisson, self.rate, shape)
         return jnp.where(mask, 0, samples)
 
     @validate_sample
@@ -651,11 +650,11 @@ class GeometricLogits(Distribution):
         dtype = jnp.result_type(logits)
         shape = sample_shape + self.batch_shape
         u = random.uniform(key, shape, dtype)
-        return jnp.floor(jnp.log1p(-u) / -softplus(logits))
+        return jnp.floor(jnp.log1p(-u) / -jax.nn.softplus(logits))
 
     @validate_sample
     def log_prob(self, value):
-        return (-value - 1) * softplus(self.logits) + self.logits
+        return (-value - 1) * jax.nn.softplus(self.logits) + self.logits
 
     @property
     def mean(self):

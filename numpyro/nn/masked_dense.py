@@ -1,12 +1,12 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
+import jax
 from jax import random
-from jax.nn.initializers import glorot_normal, normal
 import jax.numpy as jnp
 
 
-def MaskedDense(mask, bias=True, W_init=glorot_normal(), b_init=normal()):
+def MaskedDense(mask, bias=True, W_init=jax.nn.initializers.glorot_normal(), b_init=jax.nn.initializers.normal()):
     """
     As in jax.experimental.stax, each layer constructor function returns
     an (init_fun, apply_fun) pair, where `init_fun` takes an rng_key key and

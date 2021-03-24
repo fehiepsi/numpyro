@@ -2,16 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import namedtuple
-from functools import update_wrapper
+from functools import partial, update_wrapper
 import math
 
 import numpy as np
 
-from jax import jit, lax, random, vmap
-from jax.lib import xla_bridge
+import jax
+from jax import random
 import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular
-from jax.util import partial
 
 # Parameters for Transformed Rejection with Squeeze (TRS) algorithm - page 3.
 _tr_params = namedtuple('tr_params', ['c', 'b', 'a', 'alpha', 'u_r', 'v_r', 'm', 'log_p', 'log1_p', 'log_h'])
@@ -92,15 +91,15 @@ def _binomial_btrs(key, p, n):
         k, key, u, v = val
         early_accept = (jnp.abs(u) <= tr_params.u_r) & (v <= tr_params.v_r)
         early_reject = (k < 0) | (k > n)
-        return lax.cond(early_accept | early_reject,
-                        (),
-                        lambda _: ~early_accept,
-                        (k, u, v),
-                        lambda x: ~accept_fn(*x))
+        return jax.lax.cond(early_accept | early_reject,
+                            (),
+                            lambda _: ~early_accept,
+                            (k, u, v),
+                            lambda x: ~accept_fn(*x))
 
     tr_params = _get_tr_params(n, p)
-    ret = lax.while_loop(_btrs_cond_fn, _btrs_body_fn,
-                         (-1, key, 1., 1.))  # use k=-1 initially so that cond_fn returns True
+    ret = jax.lax.while_loop(_btrs_cond_fn, _btrs_body_fn,
+                             (-1, key, 1., 1.))  # use k=-1 initially so that cond_fn returns True
     return ret[0]
 
 
@@ -118,8 +117,8 @@ def _binomial_inversion(key, p, n):
         return geom_acc <= n
 
     log1_p = jnp.log1p(-p)
-    ret = lax.while_loop(_binom_inv_cond_fn, _binom_inv_body_fn,
-                         (-1, key, 0.))
+    ret = jax.lax.while_loop(_binom_inv_cond_fn, _binom_inv_body_fn,
+                             (-1, key, 0.))
     return ret[0]
 
 
@@ -128,34 +127,34 @@ def _binomial_dispatch(key, p, n):
         is_le_mid = p <= 0.5
         pq = jnp.where(is_le_mid, p, 1 - p)
         mu = n * pq
-        k = lax.cond(mu < 10,
-                     (key, pq, n),
-                     lambda x: _binomial_inversion(*x),
-                     (key, pq, n),
-                     lambda x: _binomial_btrs(*x))
+        k = jax.lax.cond(mu < 10,
+                         (key, pq, n),
+                         lambda x: _binomial_inversion(*x),
+                         (key, pq, n),
+                         lambda x: _binomial_btrs(*x))
         return jnp.where(is_le_mid, k, n - k)
 
     # Return 0 for nan `p` or negative `n`, since nan values are not allowed for integer types
     cond0 = jnp.isfinite(p) & (n > 0) & (p > 0)
-    return lax.cond(cond0 & (p < 1),
-                    (key, p, n),
-                    lambda x: dispatch(*x),
-                    (),
-                    lambda _: jnp.where(cond0, n, 0))
+    return jax.lax.cond(cond0 & (p < 1),
+                        (key, p, n),
+                        lambda x: dispatch(*x),
+                        (),
+                        lambda _: jnp.where(cond0, n, 0))
 
 
-@partial(jit, static_argnums=(3,))
+@partial(jax.jit, static_argnums=(3,))
 def _binomial(key, p, n, shape):
-    shape = shape or lax.broadcast_shapes(jnp.shape(p), jnp.shape(n))
+    shape = shape or jax.lax.broadcast_shapes(jnp.shape(p), jnp.shape(n))
     # reshape to map over axis 0
     p = jnp.reshape(jnp.broadcast_to(p, shape), -1)
     n = jnp.reshape(jnp.broadcast_to(n, shape), -1)
     key = random.split(key, jnp.size(p))
-    if xla_bridge.get_backend().platform == 'cpu':
-        ret = lax.map(lambda x: _binomial_dispatch(*x),
-                      (key, p, n))
+    if jax.default_backend() == 'cpu':
+        ret = jax.lax.map(lambda x: _binomial_dispatch(*x),
+                          (key, p, n))
     else:
-        ret = vmap(lambda *x: _binomial_dispatch(*x))(key, p, n)
+        ret = jax.vmap(lambda *x: _binomial_dispatch(*x))(key, p, n)
     return jnp.reshape(ret, shape)
 
 
@@ -163,7 +162,7 @@ def binomial(key, p, n=1, shape=()):
     return _binomial(key, p, n, shape)
 
 
-@partial(jit, static_argnums=(2,))
+@partial(jax.jit, static_argnums=(2,))
 def _categorical(key, p, shape):
     # this implementation is fast when event shape is small, and slow otherwise
     # Ref: https://stackoverflow.com/a/34190035
@@ -180,16 +179,16 @@ def categorical(key, p, shape=()):
 
 
 def _scatter_add_one(operand, indices, updates):
-    return lax.scatter_add(operand, indices, updates,
-                           lax.ScatterDimensionNumbers(update_window_dims=(),
-                                                       inserted_window_dims=(0,),
-                                                       scatter_dims_to_operand_dims=(0,)))
+    return jax.lax.scatter_add(operand, indices, updates,
+                               jax.lax.ScatterDimensionNumbers(update_window_dims=(),
+                                                               inserted_window_dims=(0,),
+                                                               scatter_dims_to_operand_dims=(0,)))
 
 
-@partial(jit, static_argnums=(3, 4))
+@partial(jax.jit, static_argnums=(3, 4))
 def _multinomial(key, p, n, n_max, shape=()):
     if jnp.shape(n) != jnp.shape(p)[:-1]:
-        broadcast_shape = lax.broadcast_shapes(jnp.shape(n), jnp.shape(p)[:-1])
+        broadcast_shape = jax.lax.broadcast_shapes(jnp.shape(n), jnp.shape(p)[:-1])
         n = jnp.broadcast_to(n, broadcast_shape)
         p = jnp.broadcast_to(p, broadcast_shape + jnp.shape(p)[-1:])
     shape = shape or p.shape[:-1]
@@ -205,10 +204,10 @@ def _multinomial(key, p, n, n_max, shape=()):
         excess = 0
     # NB: we transpose to move batch shape to the front
     indices_2D = (jnp.reshape(indices * mask, (n_max, -1,))).T
-    samples_2D = vmap(_scatter_add_one, (0, 0, 0))(jnp.zeros((indices_2D.shape[0], p.shape[-1]),
-                                                             dtype=indices.dtype),
-                                                   jnp.expand_dims(indices_2D, axis=-1),
-                                                   jnp.ones(indices_2D.shape, dtype=indices.dtype))
+    samples_2D = jax.vmap(_scatter_add_one, (0, 0, 0))(jnp.zeros((indices_2D.shape[0], p.shape[-1]),
+                                                                 dtype=indices.dtype),
+                                                       jnp.expand_dims(indices_2D, axis=-1),
+                                                       jnp.ones(indices_2D.shape, dtype=indices.dtype))
     return jnp.reshape(samples_2D, shape + p.shape[-1:]) - excess
 
 
@@ -247,7 +246,7 @@ def promote_shapes(*args, shape=()):
         return args
     else:
         shapes = [jnp.shape(arg) for arg in args]
-        num_dims = len(lax.broadcast_shapes(shape, *shapes))
+        num_dims = len(jax.lax.broadcast_shapes(shape, *shapes))
         return [_reshape(arg, (1,) * (num_dims - len(s)) + s)
                 if len(s) < num_dims else arg for arg, s in zip(args, shapes)]
 
@@ -271,10 +270,10 @@ def vec_to_tril_matrix(t, diagonal=0):
     n = round((math.sqrt(1 + 8 * t.shape[-1]) - 1) / 2) - diagonal
     n2 = n * n
     idx = jnp.reshape(jnp.arange(n2), (n, n))[jnp.tril_indices(n, diagonal)]
-    x = lax.scatter_add(jnp.zeros(t.shape[:-1] + (n2,)), jnp.expand_dims(idx, axis=-1), t,
-                        lax.ScatterDimensionNumbers(update_window_dims=range(t.ndim - 1),
-                                                    inserted_window_dims=(t.ndim - 1,),
-                                                    scatter_dims_to_operand_dims=(t.ndim - 1,)))
+    x = jax.lax.scatter_add(jnp.zeros(t.shape[:-1] + (n2,)), jnp.expand_dims(idx, axis=-1), t,
+                            jax.lax.ScatterDimensionNumbers(update_window_dims=range(t.ndim - 1),
+                                                            inserted_window_dims=(t.ndim - 1,),
+                                                            scatter_dims_to_operand_dims=(t.ndim - 1,)))
     return jnp.reshape(x, x.shape[:-1] + (n, n))
 
 
@@ -287,7 +286,7 @@ def cholesky_update(L, x, coef=1):
         1. A more efficient rank-one covariance matrix update for evolution strategies,
            Oswin Krause and Christian Igel
     """
-    batch_shape = lax.broadcast_shapes(L.shape[:-2], x.shape[:-1])
+    batch_shape = jax.lax.broadcast_shapes(L.shape[:-2], x.shape[:-1])
     L = jnp.broadcast_to(L, batch_shape + L.shape[-2:])
     x = jnp.broadcast_to(x, batch_shape + x.shape[-1:])
     diag = jnp.diagonal(L, axis1=-2, axis2=-1)
@@ -309,7 +308,7 @@ def cholesky_update(L, x, coef=1):
         return (b, w), (Dj_new, L_j)
 
     D, L = jnp.moveaxis(D, -1, 0), jnp.moveaxis(L, -1, 0)  # move scan dim to front
-    _, (D, L) = lax.scan(scan_fn, (jnp.ones(batch_shape), x), (jnp.arange(D.shape[0]), D, L))
+    _, (D, L) = jax.lax.scan(scan_fn, (jnp.ones(batch_shape), x), (jnp.arange(D.shape[0]), D, L))
     D, L = jnp.moveaxis(D, 0, -1), jnp.moveaxis(L, 0, -1)  # move scan dim back
     return L * jnp.sqrt(D)[..., None, :]
 
@@ -339,8 +338,8 @@ def logmatmulexp(x, y):
     """
     Numerically stable version of ``(x.log() @ y.log()).exp()``.
     """
-    x_shift = lax.stop_gradient(jnp.amax(x, -1, keepdims=True))
-    y_shift = lax.stop_gradient(jnp.amax(y, -2, keepdims=True))
+    x_shift = jax.lax.stop_gradient(jnp.amax(x, -1, keepdims=True))
+    y_shift = jax.lax.stop_gradient(jnp.amax(y, -2, keepdims=True))
     xy = jnp.log(jnp.matmul(jnp.exp(x - x_shift), jnp.exp(y - y_shift)))
     return xy + x_shift + y_shift
 
@@ -388,12 +387,12 @@ def von_mises_centered(key, concentration, shape=(), dtype=jnp.float64):
     """
     shape = shape or jnp.shape(concentration)
     dtype = jnp.result_type(dtype)
-    concentration = lax.convert_element_type(concentration, dtype)
+    concentration = jax.lax.convert_element_type(concentration, dtype)
     concentration = jnp.broadcast_to(concentration, shape)
     return _von_mises_centered(key, concentration, shape, dtype)
 
 
-@partial(jit, static_argnums=(2, 3))
+@partial(jax.jit, static_argnums=(2, 3))
 def _von_mises_centered(key, concentration, shape, dtype):
     # Cutoff from TensorFlow probability
     # (https://github.com/tensorflow/probability/blob/f051e03dd3cc847d31061803c2b31c564562a993/tensorflow_probability/python/distributions/von_mises.py#L567-L570)
@@ -434,7 +433,7 @@ def _von_mises_centered(key, concentration, shape, dtype):
     init_u = jnp.zeros(shape)
     init_w = jnp.zeros(shape)
 
-    _, _, done, u, w = lax.while_loop(
+    _, _, done, u, w = jax.lax.while_loop(
         cond_fun=cond_fn,
         body_fun=body_fn,
         init_val=(jnp.array(0), key, init_done, init_u, init_w)

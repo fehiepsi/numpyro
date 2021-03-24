@@ -3,8 +3,8 @@
 
 from collections import namedtuple
 
-from jax import device_put, lax, random, vmap
-from jax.flatten_util import ravel_pytree
+import jax
+from jax import random
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
 
@@ -108,7 +108,7 @@ def _sa(potential_fn=None, potential_fn_gen=None):
                 pe_fn = potential_fn_gen(*model_args, **kwargs)
         rng_key_sa, rng_key_zs, rng_key_z = random.split(rng_key, 3)
         z = init_params
-        z_flat, unravel_fn = ravel_pytree(z)
+        z_flat, unravel_fn = jax.flatten_util.ravel_pytree(z)
         if inverse_mass_matrix is None:
             inverse_mass_matrix = jnp.identity(z_flat.shape[-1]) if dense_mass else jnp.ones(z_flat.shape[-1])
         inv_mass_matrix_sqrt = jnp.linalg.cholesky(inverse_mass_matrix) if dense_mass \
@@ -121,7 +121,7 @@ def _sa(potential_fn=None, potential_fn_gen=None):
         # NB: mean is init_params
         zs = z_flat + _sample_proposal(inv_mass_matrix_sqrt, rng_key_zs, (adapt_state_size,))
         # compute potential energies
-        pes = lax.map(lambda z: pe_fn(unravel_fn(z)), zs)
+        pes = jax.lax.map(lambda z: pe_fn(unravel_fn(z)), zs)
         if dense_mass:
             cov = jnp.cov(zs, rowvar=False, bias=True)
             if cov.shape == ():  # JAX returns scalar for 1D input
@@ -137,7 +137,7 @@ def _sa(potential_fn=None, potential_fn_gen=None):
         pe = pes[k]
         sa_state = SAState(jnp.array(0), z, pe, jnp.zeros(()), jnp.zeros(()), jnp.array(False),
                            adapt_state, rng_key_sa)
-        return device_put(sa_state)
+        return sa_state
 
     def sample_kernel(sa_state, model_args=(), model_kwargs=None):
         pe_fn = potential_fn
@@ -158,7 +158,7 @@ def _sa(potential_fn=None, potential_fn_gen=None):
             scale = jnp.std(zs, 0)
 
         rng_key, rng_key_z, rng_key_reject, rng_key_accept = random.split(sa_state.rng_key, 4)
-        _, unravel_fn = ravel_pytree(sa_state.z)
+        _, unravel_fn = jax.flatten_util.ravel_pytree(sa_state.z)
 
         z = loc + _sample_proposal(scale, rng_key_z)
         pe = pe_fn(unravel_fn(z))
@@ -279,7 +279,7 @@ class SA(MCMCKernel):
             rng_key, rng_key_init_model = random.split(rng_key)
         # vectorized
         else:
-            rng_key, rng_key_init_model = jnp.swapaxes(vmap(random.split)(rng_key), 0, 1)
+            rng_key, rng_key_init_model = jnp.swapaxes(jax.vmap(random.split)(rng_key), 0, 1)
             # we need only a single key for initializing PE / constraints fn
             rng_key_init_model = rng_key_init_model[0]
         init_params = self._init_state(rng_key_init_model, model_args, model_kwargs, init_params)
@@ -300,8 +300,8 @@ class SA(MCMCKernel):
         if rng_key.ndim == 1:
             init_state = sa_init_fn(init_params, rng_key)
         else:
-            init_state = vmap(sa_init_fn)(init_params, rng_key)
-            sample_fn = vmap(self._sample_fn, in_axes=(0, None, None))
+            init_state = jax.vmap(sa_init_fn)(init_params, rng_key)
+            sample_fn = jax.vmap(self._sample_fn, in_axes=(0, None, None))
             self._sample_fn = sample_fn
         return init_state
 

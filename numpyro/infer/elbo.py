@@ -3,8 +3,8 @@
 
 import warnings
 
-from jax import random, vmap
-from jax.lax import stop_gradient
+import jax
+from jax import random
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
 
@@ -74,7 +74,7 @@ class Trace_ELBO:
             return - single_particle_elbo(rng_key)
         else:
             rng_keys = random.split(rng_key, self.num_particles)
-            return - jnp.mean(vmap(single_particle_elbo)(rng_keys))
+            return - jnp.mean(jax.vmap(single_particle_elbo)(rng_keys))
 
 
 class ELBO(Trace_ELBO):
@@ -180,7 +180,7 @@ class TraceMeanField_ELBO(Trace_ELBO):
             return - single_particle_elbo(rng_key)
         else:
             rng_keys = random.split(rng_key, self.num_particles)
-            return - jnp.mean(vmap(single_particle_elbo)(rng_keys))
+            return - jnp.mean(jax.vmap(single_particle_elbo)(rng_keys))
 
 
 class RenyiELBO(Trace_ELBO):
@@ -242,10 +242,10 @@ class RenyiELBO(Trace_ELBO):
             return elbo
 
         rng_keys = random.split(rng_key, self.num_particles)
-        elbos = vmap(single_particle_elbo)(rng_keys)
+        elbos = jax.vmap(single_particle_elbo)(rng_keys)
         scaled_elbos = (1. - self.alpha) * elbos
         avg_log_exp = logsumexp(scaled_elbos) - jnp.log(self.num_particles)
         weights = jnp.exp(scaled_elbos - avg_log_exp)
         renyi_elbo = avg_log_exp / (1. - self.alpha)
-        weighted_elbo = jnp.dot(stop_gradient(weights), elbos) / self.num_particles
-        return - (stop_gradient(renyi_elbo - weighted_elbo) + weighted_elbo)
+        weighted_elbo = jnp.dot(jax.lax.stop_gradient(weights), elbos) / self.num_particles
+        return - (jax.lax.stop_gradient(renyi_elbo - weighted_elbo) + weighted_elbo)

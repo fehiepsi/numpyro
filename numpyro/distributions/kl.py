@@ -28,7 +28,7 @@
 from functools import total_ordering
 import warnings
 
-from jax import lax
+import jax
 import jax.numpy as jnp
 
 from numpyro.distributions.continuous import Normal
@@ -120,21 +120,21 @@ def kl_divergence(p, q):
 @register_kl(Distribution, ExpandedDistribution)
 def _kl_dist_expanded(p, q):
     kl = kl_divergence(p, q.base_dist)
-    shape = lax.broadcast_shapes(p.batch_shape, q.batch_shape)
+    shape = jax.lax.broadcast_shapes(p.batch_shape, q.batch_shape)
     return jnp.broadcast_to(kl, shape)
 
 
 @register_kl(ExpandedDistribution, Distribution)
 def _kl_expanded(p, q):
     kl = kl_divergence(p.base_dist, q)
-    shape = lax.broadcast_shapes(p.batch_shape, q.batch_shape)
+    shape = jax.lax.broadcast_shapes(p.batch_shape, q.batch_shape)
     return jnp.broadcast_to(kl, shape)
 
 
 @register_kl(ExpandedDistribution, ExpandedDistribution)
 def _kl_expanded_expanded(p, q):
     kl = kl_divergence(p.base_dist, q.base_dist)
-    shape = lax.broadcast_shapes(p.batch_shape, q.batch_shape)
+    shape = jax.lax.broadcast_shapes(p.batch_shape, q.batch_shape)
     return jnp.broadcast_to(kl, shape)
 
 

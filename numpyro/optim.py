@@ -10,12 +10,10 @@ suited for working with NumPyro inference algorithms.
 from collections import namedtuple
 from typing import Callable, Tuple, TypeVar
 
-from jax import lax, value_and_grad
+import jax
 from jax.experimental import optimizers
-from jax.flatten_util import ravel_pytree
 import jax.numpy as jnp
 from jax.scipy.optimize import minimize
-from jax.tree_util import register_pytree_node, tree_map
 
 __all__ = [
     'Adam',
@@ -74,7 +72,7 @@ class _NumPyroOptim(object):
         :return: a pair of the output of objective function and the new optimizer state.
         """
         params = self.get_params(state)
-        out, grads = value_and_grad(fn)(params)
+        out, grads = jax.value_and_grad(fn)(params)
         return out, self.update(grads, state)
 
     def eval_and_stable_update(self, fn: Callable, state: _IterOptState) -> _IterOptState:
@@ -88,11 +86,11 @@ class _NumPyroOptim(object):
         :return: a pair of the output of objective function and the new optimizer state.
         """
         params = self.get_params(state)
-        out, grads = value_and_grad(fn)(params)
-        out, state = lax.cond(jnp.isfinite(out) & jnp.isfinite(ravel_pytree(grads)[0]).all(),
-                              lambda _: (out, self.update(grads, state)),
-                              lambda _: (jnp.nan, state),
-                              None)
+        out, grads = jax.value_and_grad(fn)(params)
+        out, state = jax.lax.cond(jnp.isfinite(out) & jnp.isfinite(jax.flatten_util.ravel_pytree(grads)[0]).all(),
+                                  lambda _: (out, self.update(grads, state)),
+                                  lambda _: (jnp.nan, state),
+                                  None)
         return out, state
 
     def get_params(self, state: _IterOptState) -> _Params:
@@ -140,7 +138,7 @@ class ClippedAdam(_NumPyroOptim):
     def update(self, g, state):
         i, opt_state = state
         # clip norm
-        g = tree_map(lambda g_: jnp.clip(g_, a_min=-self.clip_norm, a_max=self.clip_norm), g)
+        g = jax.tree_util.tree_map(lambda g_: jnp.clip(g_, a_min=-self.clip_norm, a_max=self.clip_norm), g)
         opt_state = self.update_fn(i, g, opt_state)
         return i + 1, opt_state
 
@@ -187,7 +185,7 @@ class SM3(_NumPyroOptim):
 # When arbitrary pytree is supported in JAX, we can just simply use
 # identity functions for `init_fn` and `get_params`.
 _MinimizeState = namedtuple("MinimizeState", ["flat_params", "unravel_fn"])
-register_pytree_node(
+jax.tree_util.register_pytree_node(
     _MinimizeState,
     lambda state: ((state.flat_params,), (state.unravel_fn,)),
     lambda data, xs: _MinimizeState(xs[0], data[0]))
@@ -195,7 +193,7 @@ register_pytree_node(
 
 def _minimize_wrapper():
     def init_fn(params):
-        flat_params, unravel_fn = ravel_pytree(params)
+        flat_params, unravel_fn = jax.tree_util.ravel_pytree(params)
         return _MinimizeState(flat_params, unravel_fn)
 
     def update_fn(i, grad_tree, opt_state):

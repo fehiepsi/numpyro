@@ -8,9 +8,9 @@ import warnings
 
 import numpy as np
 
-from jax import hessian, lax, random, tree_map
+import jax
+from jax import random
 from jax.experimental import stax
-from jax.flatten_util import ravel_pytree
 import jax.numpy as jnp
 
 import numpyro
@@ -234,11 +234,11 @@ class AutoNormal(AutoGuide):
         sample_shape = jnp.shape(latent_samples[name])[
             :jnp.ndim(latent_samples[name]) - jnp.ndim(self._init_locs[name])]
         if sample_shape:
-            flatten_samples = tree_map(lambda x: jnp.reshape(x, (-1,) + jnp.shape(x)[len(sample_shape):]),
-                                       latent_samples)
-            contrained_samples = lax.map(self._postprocess_fn, flatten_samples)
-            return tree_map(lambda x: jnp.reshape(x, sample_shape + jnp.shape(x)[1:]),
-                            contrained_samples)
+            flatten_samples = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + jnp.shape(x)[len(sample_shape):]),
+                                                     latent_samples)
+            contrained_samples = jax.lax.map(self._postprocess_fn, flatten_samples)
+            return jax.tree_util.tree_map(lambda x: jnp.reshape(x, sample_shape + jnp.shape(x)[1:]),
+                                          contrained_samples)
         else:
             return self._postprocess_fn(latent_samples)
 
@@ -377,7 +377,7 @@ class AutoContinuous(AutoGuide):
     """
     def _setup_prototype(self, *args, **kwargs):
         super()._setup_prototype(*args, **kwargs)
-        self._init_latent, unpack_latent = ravel_pytree(self._init_locs)
+        self._init_latent, unpack_latent = jax.flatten_util.ravel_pytree(self._init_locs)
         # this is to match the behavior of Pyro, where we can apply
         # unpack_latent for a batch of samples
         self._unpack_latent = UnpackTransform(unpack_latent)
@@ -442,9 +442,9 @@ class AutoContinuous(AutoGuide):
         sample_shape = jnp.shape(latent_sample)[:-1]
         if sample_shape:
             latent_sample = jnp.reshape(latent_sample, (-1, jnp.shape(latent_sample)[-1]))
-            unpacked_samples = lax.map(unpack_single_latent, latent_sample)
-            return tree_map(lambda x: jnp.reshape(x, sample_shape + jnp.shape(x)[1:]),
-                            unpacked_samples)
+            unpacked_samples = jax.lax.map(unpack_single_latent, latent_sample)
+            return jax.tree_util.tree_map(lambda x: jnp.reshape(x, sample_shape + jnp.shape(x)[1:]),
+                                          unpacked_samples)
         else:
             return unpack_single_latent(latent_sample)
 
@@ -757,7 +757,7 @@ class AutoLaplaceApproximation(AutoContinuous):
             return self._loss_fn(params1)
 
         loc = params['{}_loc'.format(self.prefix)]
-        precision = hessian(loss_fn)(loc)
+        precision = jax.hessian(loss_fn)(loc)
         scale_tril = cholesky_of_inverse(precision)
         if not_jax_tracer(scale_tril):
             if np.any(np.isnan(scale_tril)):

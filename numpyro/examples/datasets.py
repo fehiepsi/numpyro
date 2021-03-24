@@ -15,8 +15,8 @@ import zipfile
 
 import numpy as np
 
-from jax import device_put, lax
-from jax.interpreters.xla import DeviceArray
+import jax
+import jax.numpy as jnp
 
 if 'CI' in os.environ:
     DATA_DIR = os.path.expanduser('~/.data')
@@ -90,7 +90,7 @@ def _load_baseball():
                 train.append(np.array([int(at_bats), int(hits)]))
                 season_at_bats, season_hits = row['SeasonAt-Bats'], row['SeasonHits']
                 test.append(np.array([int(season_at_bats), int(season_hits)]))
-        return np.stack(train), np.stack(test), np.array(player_names)
+        return np.stack(train), np.stack(test), player_names
 
     train, test, player_names = train_test_split(os.path.join(DATA_DIR, 'EfronMorrisBB.txt'))
     return {'train': (train, player_names),
@@ -132,13 +132,13 @@ def _load_mnist():
         with gzip.open(file, 'rb') as f:
             f.read(8)
             data = np.frombuffer(f.read(), dtype=np.int8) / np.float32(255.)
-            return device_put(data)
+            return data
 
     def read_img(file):
         with gzip.open(file, 'rb') as f:
             _, _, nrows, ncols = struct.unpack(">IIII", f.read(16))
             data = np.frombuffer(f.read(), dtype=np.uint8) / np.float32(255.)
-            return device_put(data.reshape(-1, nrows, ncols))
+            return data.reshape(-1, nrows, ncols)
 
     files = [os.path.join(DATA_DIR, os.path.basename(urlparse(url).path))
              for url in MNIST.urls]
@@ -306,8 +306,8 @@ def load_dataset(dset, batch_size=None, split='train', shuffle=True, num_datapoi
         return num_records // batch_size, np.random.permutation(idxs) if shuffle else idxs
 
     def get_batch(i=0, idxs=idxs):
-        ret_idx = lax.dynamic_slice_in_dim(idxs, i * batch_size, batch_size)
-        return tuple(lax.index_take(a, (ret_idx,), axes=(0,)) if isinstance(a, DeviceArray)
+        ret_idx = jax.lax.dynamic_slice_in_dim(idxs, i * batch_size, batch_size)
+        return tuple(jnp.take(a, ret_idx, axis=0) if not isinstance(a, list)
                      else np.take(a, ret_idx, axis=0) for a in arrays)
 
     return init, get_batch

@@ -7,11 +7,9 @@ from operator import attrgetter
 import os
 import warnings
 
-from jax import jit, lax, local_device_count, pmap, random, vmap
-from jax.core import Tracer
-from jax.interpreters.xla import DeviceArray
+import jax
+from jax import random
 import jax.numpy as jnp
-from jax.tree_util import tree_flatten, tree_map, tree_multimap
 
 from numpyro.diagnostics import print_summary
 from numpyro.util import cached_by, fori_collect, identity
@@ -147,18 +145,18 @@ def _get_progbar_desc_str(num_warmup, phase, i):
 
 
 def _get_value_from_index(xs, i):
-    return tree_map(lambda x: x[i], xs)
+    return jax.tree_util.tree_map(lambda x: x[i], xs)
 
 
 def _laxmap(f, xs):
-    n = tree_flatten(xs)[0][0].shape[0]
+    n = jax.tree_util.tree_flatten(xs)[0][0].shape[0]
 
     ys = []
     for i in range(n):
-        x = jit(_get_value_from_index)(xs, i)
+        x = jax.jit(_get_value_from_index)(xs, i)
         ys.append(f(x))
 
-    return tree_multimap(lambda *args: jnp.stack(args), *ys)
+    return jax.tree_util.tree_multimap(lambda *args: jnp.stack(args), *ys)
 
 
 def _sample_fn_jit_args(state, sampler):
@@ -185,9 +183,9 @@ def _collect_fn(collect_fields):
 # XXX: Is there a better hash key that we can use?
 def _hashable(x):
     # When the arguments are JITed, ShapedArray is hashable.
-    if isinstance(x, Tracer):
+    if isinstance(x, jax.core.Tracer):
         return x
-    elif isinstance(x, DeviceArray):
+    elif isinstance(x, jax.interpreters.xla.DeviceArray):
         return x.copy().tobytes()
     elif isinstance(x, jnp.ndarray):
         return x.tobytes()
@@ -252,14 +250,14 @@ class MCMC(object):
         if chain_method not in ['parallel', 'vectorized', 'sequential']:
             raise ValueError('Only supporting the following methods to draw chains:'
                              ' "sequential", "parallel", or "vectorized"')
-        if chain_method == 'parallel' and local_device_count() < self.num_chains:
+        if chain_method == 'parallel' and jax.local_device_count() < self.num_chains:
             chain_method = 'sequential'
             warnings.warn('There are not enough devices to run parallel chains: expected {} but got {}.'
                           ' Chains will be drawn sequentially. If you are running MCMC in CPU,'
                           ' consider using `numpyro.set_host_device_count({})` at the beginning'
                           ' of your program. You can double-check how many devices are available in'
                           ' your system using `jax.local_device_count()`.'
-                          .format(self.num_chains, local_device_count(), self.num_chains))
+                          .format(self.num_chains, jax.local_device_count(), self.num_chains))
         self.chain_method = chain_method
         self.progress_bar = progress_bar
         if "CI" in os.environ or "PYTEST_XDIST_WORKER" in os.environ:
@@ -281,8 +279,8 @@ class MCMC(object):
         if self._jit_model_args:
             args, kwargs = (None,), (None,)
         else:
-            args = tree_map(lambda x: _hashable(x), self._args)
-            kwargs = tree_map(lambda x: _hashable(x), tuple(sorted(self._kwargs.items())))
+            args = jax.tree_util.tree_map(lambda x: _hashable(x), self._args)
+            kwargs = jax.tree_util.tree_map(lambda x: _hashable(x), tuple(sorted(self._kwargs.items())))
         key = args + kwargs
         try:
             fns = self._cache.get(key, None)
@@ -298,17 +296,17 @@ class MCMC(object):
                 else:
                     body_fn = self.postprocess_fn
                 if self.chain_method == "vectorized" and self.num_chains > 1:
-                    body_fn = vmap(body_fn)
+                    body_fn = jax.vmap(body_fn)
 
-                return lax.map(body_fn, states)
+                return jax.lax.map(body_fn, states)
 
             if self._jit_model_args:
                 sample_fn = partial(_sample_fn_jit_args, sampler=self.sampler)
-                postprocess_fn = jit(laxmap_postprocess_fn)
+                postprocess_fn = jax.jit(laxmap_postprocess_fn)
             else:
                 sample_fn = partial(_sample_fn_nojit_args, sampler=self.sampler,
                                     args=self._args, kwargs=self._kwargs)
-                postprocess_fn = jit(partial(laxmap_postprocess_fn,
+                postprocess_fn = jax.jit(partial(laxmap_postprocess_fn,
                                              args=self._args, kwargs=self._kwargs))
 
             fns = sample_fn, postprocess_fn
@@ -318,8 +316,8 @@ class MCMC(object):
 
     def _get_cached_init_state(self, rng_key, args, kwargs):
         rng_key = (_hashable(rng_key),)
-        args = tree_map(lambda x: _hashable(x), args)
-        kwargs = tree_map(lambda x: _hashable(x), tuple(sorted(kwargs.items())))
+        args = jax.tree_util.tree_map(lambda x: _hashable(x), args)
+        kwargs = jax.tree_util.tree_map(lambda x: _hashable(x), tuple(sorted(kwargs.items())))
         key = rng_key + args + kwargs
         try:
             return self._init_state_cache.get(key, None)
@@ -359,7 +357,7 @@ class MCMC(object):
             states = (states,)
         states = dict(zip(collect_fields, states))
         # Apply constraints if number of samples is non-zero
-        site_values = tree_flatten(states[self._sample_field])[0]
+        site_values = jax.tree_util.tree_flatten(states[self._sample_field])[0]
         # XXX: lax.map still works if some arrays have 0 size
         # so we only need to filter out the case site_value.shape[0] == 0
         # (which happens when lower_idx==upper_idx)
@@ -380,8 +378,8 @@ class MCMC(object):
         self._set_collection_params(0, 0, self.num_samples)
         self.run(rng_key, *args, extra_fields=extra_fields, init_params=init_params, **kwargs)
         rng_key = (_hashable(rng_key),)
-        args = tree_map(lambda x: _hashable(x), args)
-        kwargs = tree_map(lambda x: _hashable(x), tuple(sorted(kwargs.items())))
+        args = jax.tree_util.tree_map(lambda x: _hashable(x), args)
+        kwargs = jax.tree_util.tree_map(lambda x: _hashable(x), tuple(sorted(kwargs.items())))
         key = rng_key + args + kwargs
         try:
             self._init_state_cache[key] = self._last_state
@@ -470,7 +468,7 @@ class MCMC(object):
             See https://jax.readthedocs.io/en/latest/async_dispatch.html and
             https://jax.readthedocs.io/en/latest/profiling.html for pointers on profiling jax programs.
         """
-        init_params = tree_map(lambda x: lax.convert_element_type(x, jnp.result_type(x)), init_params)
+        init_params = jax.tree_util.tree_map(lambda x: jax.lax.convert_element_type(x, jnp.result_type(x)), init_params)
         self._args = args
         self._kwargs = kwargs
         init_state = self._get_cached_init_state(rng_key, args, kwargs)
@@ -482,7 +480,7 @@ class MCMC(object):
             init_state = self._warmup_state._replace(rng_key=rng_key)
 
         if init_params is not None and self.num_chains > 1:
-            prototype_init_val = tree_flatten(init_params)[0][0]
+            prototype_init_val = jax.tree_util.tree_flatten(init_params)[0][0]
             if jnp.shape(prototype_init_val)[0] != self.num_chains:
                 raise ValueError('`init_params` must have the same leading dimension'
                                  ' as `num_chains`.')
@@ -496,18 +494,18 @@ class MCMC(object):
         map_args = (rng_key, init_state, init_params)
         if self.num_chains == 1:
             states_flat, last_state = partial_map_fn(map_args)
-            states = tree_map(lambda x: x[jnp.newaxis, ...], states_flat)
+            states = jax.tree_util.tree_map(lambda x: x[jnp.newaxis, ...], states_flat)
         else:
             if self.chain_method == 'sequential':
                 states, last_state = _laxmap(partial_map_fn, map_args)
             elif self.chain_method == 'parallel':
-                states, last_state = pmap(partial_map_fn)(map_args)
+                states, last_state = jax.pmap(partial_map_fn)(map_args)
             else:
                 assert self.chain_method == 'vectorized'
                 states, last_state = partial_map_fn(map_args)
                 # swap num_samples x num_chains to num_chains x num_samples
-                states = tree_map(lambda x: jnp.swapaxes(x, 0, 1), states)
-            states_flat = tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), states)
+                states = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), states)
+            states_flat = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), states)
         self._last_state = last_state
         self._states = states
         self._states_flat = states_flat

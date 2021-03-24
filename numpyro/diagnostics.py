@@ -10,8 +10,7 @@ from itertools import product
 
 import numpy as np
 
-from jax import device_get
-from jax.tree_util import tree_flatten, tree_map
+import jax
 
 __all__ = [
     'autocorrelation',
@@ -235,13 +234,13 @@ def summary(samples, prob=0.90, group_by_chain=True):
         chain dimension).
     """
     if not group_by_chain:
-        samples = tree_map(lambda x: x[None, ...], samples)
+        samples = jax.tree_util.tree_map(lambda x: x[None, ...], samples)
     if not isinstance(samples, dict):
-        samples = {'Param:{}'.format(i): v for i, v in enumerate(tree_flatten(samples)[0])}
+        samples = {'Param:{}'.format(i): v for i, v in enumerate(jax.tree_util.tree_flatten(samples)[0])}
 
     summary_dict = {}
     for name, value in samples.items():
-        value = device_get(value)
+        value = jax.device_get(value)
         value_flat = np.reshape(value, (-1,) + value.shape[2:])
         mean = value_flat.mean(axis=0)
         std = value_flat.std(axis=0, ddof=1)
@@ -275,9 +274,9 @@ def print_summary(samples, prob=0.90, group_by_chain=True):
         chain dimension).
     """
     if not group_by_chain:
-        samples = tree_map(lambda x: x[None, ...], samples)
+        samples = jax.tree_util.tree_map(lambda x: x[None, ...], samples)
     if not isinstance(samples, dict):
-        samples = {'Param:{}'.format(i): v for i, v in enumerate(tree_flatten(samples)[0])}
+        samples = {'Param:{}'.format(i): v for i, v in enumerate(jax.tree_util.tree_flatten(samples)[0])}
     summary_dict = summary(samples, prob, group_by_chain=True)
 
     row_names = {k: k + '[' + ','.join(map(lambda x: str(x - 1), v.shape[2:])) + ']'

@@ -8,7 +8,8 @@ import warnings
 
 import numpy as np
 
-from jax import device_put, grad, hessian, jacfwd, jacobian, lax, ops, random, value_and_grad
+import jax
+from jax import random
 import jax.numpy as jnp
 from jax.scipy.special import expit
 
@@ -130,7 +131,7 @@ class HMCGibbs(MCMCKernel):
 
         z = {**gibbs_sites, **hmc_state.z}
 
-        return device_put(HMCGibbsState(z, hmc_state, rng_key))
+        return HMCGibbsState(z, hmc_state, rng_key)
 
     def sample(self, state, model_args, model_kwargs):
         model_kwargs = {} if model_kwargs is None else model_kwargs
@@ -150,9 +151,9 @@ class HMCGibbs(MCMCKernel):
 
         if self.inner_kernel._forward_mode_differentiation:
             pe = potential_fn(z_gibbs, state.hmc_state.z)
-            z_grad = jacfwd(partial(potential_fn, z_gibbs))(state.hmc_state.z)
+            z_grad = jax.jacfwd(partial(potential_fn, z_gibbs))(state.hmc_state.z)
         else:
-            pe, z_grad = value_and_grad(partial(potential_fn, z_gibbs))(state.hmc_state.z)
+            pe, z_grad = jax.value_and_grad(partial(potential_fn, z_gibbs))(state.hmc_state.z)
         hmc_state = state.hmc_state._replace(z_grad=z_grad, potential_energy=pe)
 
         model_kwargs_["_gibbs_sites"] = z_gibbs
@@ -167,7 +168,7 @@ def _discrete_gibbs_proposal_body_fn(z_init_flat, unravel_fn, pe_init, potential
     rng_key, z, pe, log_weight_sum = val
     rng_key, rng_transition = random.split(rng_key)
     proposal = jnp.where(i >= z_init_flat[idx], i + 1, i)
-    z_new_flat = ops.index_update(z_init_flat, idx, proposal)
+    z_new_flat = z_init_flat.at[idx].set(proposal)
     z_new = unravel_fn(z_new_flat)
     pe_new = potential_fn(z_new)
     log_weight_new = pe_init - pe_new
@@ -226,7 +227,7 @@ def _discrete_rw_proposal(rng_key, z_discrete, pe, potential_fn, idx, support_si
     z_discrete_flat, unravel_fn = ravel_pytree(z_discrete)
 
     proposal = random.randint(rng_proposal, (), minval=0, maxval=support_size)
-    z_new_flat = ops.index_update(z_discrete_flat, idx, proposal)
+    z_new_flat = z_discrete_flat.at[idx].set(proposal)
     z_new = unravel_fn(z_new_flat)
     pe_new = potential_fn(z_new)
     log_accept_ratio = pe - pe_new
@@ -242,7 +243,7 @@ def _discrete_modified_rw_proposal(rng_key, z_discrete, pe, potential_fn, idx, s
     i = random.randint(rng_proposal, (), minval=0, maxval=support_size - 1)
     proposal = jnp.where(i >= z_discrete_flat[idx], i + 1, i)
     proposal = jnp.where(random.bernoulli(rng_stay, stay_prob), idx, proposal)
-    z_new_flat = ops.index_update(z_discrete_flat, idx, proposal)
+    z_new_flat = z_discrete_flat.at[idx].set(proposal)
     z_new = unravel_fn(z_new_flat)
     pe_new = potential_fn(z_new)
     log_accept_ratio = pe - pe_new
@@ -385,9 +386,9 @@ class DiscreteHMCGibbs(HMCGibbs):
                                pe=state.hmc_state.potential_energy)
 
         if self.inner_kernel._forward_mode_differentiation:
-            z_grad = jacfwd(partial(potential_fn, z_gibbs))(state.hmc_state.z)
+            z_grad = jax.jacfwd(partial(potential_fn, z_gibbs))(state.hmc_state.z)
         else:
-            z_grad = grad(partial(potential_fn, z_gibbs))(state.hmc_state.z)
+            z_grad = jax.grad(partial(potential_fn, z_gibbs))(state.hmc_state.z)
         hmc_state = state.hmc_state._replace(z_grad=z_grad, potential_energy=pe)
 
         model_kwargs_["_gibbs_sites"] = z_gibbs
@@ -408,7 +409,7 @@ def _update_block(rng_key, num_blocks, subsample_idx, plate_size):
     new_idx = random.randint(subkey, minval=0, maxval=size, shape=(block_size,))
     subsample_idx_padded = jnp.pad(subsample_idx, (0, pad))
     start = chosen_block * block_size
-    subsample_idx_padded = lax.dynamic_update_slice_in_dim(
+    subsample_idx_padded = jax.lax.dynamic_update_slice_in_dim(
         subsample_idx_padded, new_idx, start, 0)
     return rng_key, subsample_idx_padded[:subsample_size], pad, new_idx, start
 
@@ -566,7 +567,7 @@ class HMCECS(HMCGibbs):
         pe_new = potential_fn(z_gibbs_new, gibbs_state_new, state.hmc_state.z)
         accept_prob = jnp.clip(jnp.exp(pe - pe_new), a_max=1.0)
         transition = random.bernoulli(rng_key, accept_prob)
-        grad_ = jacfwd if self.inner_kernel._forward_mode_differentiation else grad
+        grad_ = jax.jacfwd if self.inner_kernel._forward_mode_differentiation else jax.grad
         z_gibbs, gibbs_state, pe, z_grad = cond(transition,
                                                 (z_gibbs_new, gibbs_state_new, pe_new),
                                                 lambda vals: vals + (grad_(partial(potential_fn,
@@ -656,13 +657,13 @@ def taylor_proxy(reference_params):
 
         # those stats are dict keyed by subsample names
         ref_log_likelihoods_sum = log_likelihood_sum(ref_params_flat)
-        ref_log_likelihood_grads_sum = jacobian(log_likelihood_sum)(ref_params_flat)
-        ref_log_likelihood_hessians_sum = hessian(log_likelihood_sum)(ref_params_flat)
+        ref_log_likelihood_grads_sum = jax.jacobian(log_likelihood_sum)(ref_params_flat)
+        ref_log_likelihood_hessians_sum = jax.hessian(log_likelihood_sum)(ref_params_flat)
 
         def gibbs_init(rng_key, gibbs_sites):
             ref_subsample_log_liks = log_likelihood(ref_params_flat, gibbs_sites)
-            ref_subsample_log_lik_grads = jacfwd(log_likelihood)(ref_params_flat, gibbs_sites)
-            ref_subsample_log_lik_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_grads = jax.jacfwd(log_likelihood)(ref_params_flat, gibbs_sites)
+            ref_subsample_log_lik_hessians = jax.jacfwd(jax.jacfwd(log_likelihood))(ref_params_flat, gibbs_sites)
             return TaylorProxyState(ref_subsample_log_liks, ref_subsample_log_lik_grads, ref_subsample_log_lik_hessians)
 
         def gibbs_update(rng_key, gibbs_sites, gibbs_state):
@@ -670,8 +671,8 @@ def taylor_proxy(reference_params):
 
             new_states = defaultdict(dict)
             ref_subsample_log_liks = log_likelihood(ref_params_flat, new_idxs)
-            ref_subsample_log_lik_grads = jacfwd(log_likelihood)(ref_params_flat, new_idxs)
-            ref_subsample_log_lik_hessians = jacfwd(jacfwd(log_likelihood))(ref_params_flat, new_idxs)
+            ref_subsample_log_lik_grads = jax.jacfwd(log_likelihood)(ref_params_flat, new_idxs)
+            ref_subsample_log_lik_hessians = jax.jacfwd(jax.jacfwd(log_likelihood))(ref_params_flat, new_idxs)
             for stat, new_block_values, last_values in zip(
                     ["log_liks", "grads", "hessians"],
                     [ref_subsample_log_liks,
@@ -684,7 +685,7 @@ def taylor_proxy(reference_params):
                     size, subsample_size = subsample_plate_sizes[name]
                     pad, start = pads[name], starts[name]
                     new_value = jnp.pad(last_values[name], [(0, pad)] + [(0, 0)] * (jnp.ndim(last_values[name]) - 1))
-                    new_value = lax.dynamic_update_slice_in_dim(
+                    new_value = jax.lax.dynamic_update_slice_in_dim(
                         new_value, new_block_values[name], start, 0)
                     new_states[stat][name] = new_value[:subsample_size]
             gibbs_state = TaylorProxyState(new_states["log_liks"], new_states["grads"], new_states["hessians"])
