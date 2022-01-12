@@ -17,6 +17,7 @@ import numpyro
 from numpyro.distributions.transforms import biject_to
 from numpyro.handlers import block, condition, seed, substitute, trace
 from numpyro.infer.hmc import HMC
+from numpyro.infer.initialization import init_to_sample
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import _unconstrain_reparam
 from numpyro.util import cond, fori_loop, identity
@@ -124,7 +125,7 @@ class HMCGibbs(MCMCKernel):
         model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
         if self._prototype_trace is None:
             rng_key, key_u = random.split(rng_key)
-            self._prototype_trace = trace(seed(self.model, key_u)).get_trace(
+            self._prototype_trace = trace(substitute(seed(self.model, key_u), substitute_fn=init_to_sample)).get_trace(
                 *model_args, **model_kwargs
             )
 
