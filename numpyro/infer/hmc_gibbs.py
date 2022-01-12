@@ -408,7 +408,7 @@ class DiscreteHMCGibbs(HMCGibbs):
     def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
         model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
         rng_key, key_u = random.split(rng_key)
-        self._prototype_trace = trace(seed(self.model, key_u)).get_trace(
+        self._prototype_trace = trace(substitute(seed(self.model, key_u), substitute_fn=init_to_sample)).get_trace(
             *model_args, **model_kwargs
         )
 
@@ -606,7 +606,7 @@ class HMCECS(HMCGibbs):
     def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
         model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
         rng_key, key_u = random.split(rng_key)
-        self._prototype_trace = trace(seed(self.model, key_u)).get_trace(
+        self._prototype_trace = trace(substitute(seed(self.model, key_u), substitute_fn=init_to_sample)).get_trace(
             *model_args, **model_kwargs
         )
         self._subsample_plate_sizes = {
