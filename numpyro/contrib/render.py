@@ -112,7 +112,8 @@ def get_model_relations(model, model_args=None, model_kwargs=None):
     }
 
     def get_log_probs(sample):
-        with handlers.trace() as tr, handlers.substitute(data=sample):
+        # Note: We use seed 0 for parameter initialization.
+        with handlers.trace() as tr, handlers.seed(rng_seed=0), handlers.substitute(data=sample):
             model(*model_args, **model_kwargs)
         return {
             name: site["fn"].log_prob(site["value"])
