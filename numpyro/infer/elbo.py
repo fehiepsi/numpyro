@@ -6,6 +6,7 @@ from functools import partial
 from operator import itemgetter
 import warnings
 
+import jax
 from jax import eval_shape, random, vmap
 from jax.lax import stop_gradient
 import jax.numpy as jnp
@@ -33,6 +34,9 @@ class ELBO:
 
     :param num_particles: The number of particles/samples used to form the ELBO
         (gradient) estimators.
+    :param vectorize_particles: Whether to use `jax.vmap` to compute ELBOs over the
+        num_particles-many particles in parallel. If False use `jax.lax.map`.
+        Defaults to True.
     """
 
     """
@@ -42,8 +46,9 @@ class ELBO:
     """
     can_infer_discrete = False
 
-    def __init__(self, num_particles=1):
+    def __init__(self, num_particles=1, vectorize_particles=True):
         self.num_particles = num_particles
+        self.vectorize_particles = vectorize_particles
 
     def loss(self, rng_key, param_map, model, guide, *args, **kwargs):
         """
@@ -108,10 +113,10 @@ class Trace_ELBO(ELBO):
 
     :param num_particles: The number of particles/samples used to form the ELBO
         (gradient) estimators.
+    :param vectorize_particles: Whether to use `jax.vmap` to compute ELBOs over the
+        num_particles-many particles in parallel. If False use `jax.lax.map`.
+        Defaults to True.
     """
-
-    def __init__(self, num_particles=1):
-        self.num_particles = num_particles
 
     def loss_with_mutable_state(
         self, rng_key, param_map, model, guide, *args, **kwargs
@@ -163,7 +168,10 @@ class Trace_ELBO(ELBO):
             return {"loss": -elbo, "mutable_state": mutable_state}
         else:
             rng_keys = random.split(rng_key, self.num_particles)
-            elbos, mutable_state = vmap(single_particle_elbo)(rng_keys)
+            if self.vectorize_particles:
+                elbos, mutable_state = vmap(single_particle_elbo)(rng_keys)
+            else:
+                elbos, mutable_state = jax.lax.map(single_particle_elbo, rng_keys)
             return {"loss": -jnp.mean(elbos), "mutable_state": mutable_state}
 
 
@@ -291,7 +299,10 @@ class TraceMeanField_ELBO(ELBO):
             return {"loss": -elbo, "mutable_state": mutable_state}
         else:
             rng_keys = random.split(rng_key, self.num_particles)
-            elbos, mutable_state = vmap(single_particle_elbo)(rng_keys)
+            if self.vectorize_particles:
+                elbos, mutable_state = vmap(single_particle_elbo)(rng_keys)
+            else:
+                elbos, mutable_state = jax.lax.map(single_particle_elbo, rng_keys)
             return {"loss": -jnp.mean(elbos), "mutable_state": mutable_state}
 
 
@@ -311,6 +322,30 @@ class RenyiELBO(ELBO):
         Here :math:`\alpha \neq 1`. Default is 0.
     :param num_particles: The number of particles/samples
         used to form the objective (gradient) estimator. Default is 2.
+    :param vectorize_particles: Whether to use `jax.vmap` to compute ELBOs over the
+        num_particles-many particles in parallel. If False use `jax.lax.map`.
+        Defaults to True.
+
+    Example::
+
+        def model(data):
+            with numpyro.plate("batch", 10000, subsample_size=100):
+                latent = numpyro.sample("latent", dist.Normal(0, 1))
+                batch = numpyro.subsample(data, event_dim=0)
+                numpyro.sample("data", dist.Bernoulli(logits=latent), obs=batch)
+
+        def guide(data):
+            w_loc = numpyro.param("w_loc", 1.)
+            w_scale = numpyro.param("w_scale", 1.)
+            with numpyro.plate("batch", 10000, subsample_size=100):
+                batch = numpyro.subsample(data, event_dim=0)
+                loc = w_loc * batch
+                scale = jnp.exp(w_scale * batch)
+                numpyro.sample("latent", dist.Normal(loc, scale))
+
+        elbo = RenyiELBO(num_particles=10)
+        svi = SVI(model, guide, optax.adam(0.1), elbo)
+
 
     **References:**
 
@@ -327,37 +362,102 @@ class RenyiELBO(ELBO):
         self.alpha = alpha
         super().__init__(num_particles=num_particles)
 
-    def loss(self, rng_key, param_map, model, guide, *args, **kwargs):
-        def single_particle_elbo(rng_key):
-            model_seed, guide_seed = random.split(rng_key)
-            seeded_model = seed(model, model_seed)
-            seeded_guide = seed(guide, guide_seed)
-            guide_log_density, guide_trace = log_density(
-                seeded_guide, args, kwargs, param_map
-            )
-            # NB: we only want to substitute params not available in guide_trace
-            model_param_map = {
-                k: v for k, v in param_map.items() if k not in guide_trace
-            }
-            seeded_model = replay(seeded_model, guide_trace)
-            model_log_density, model_trace = log_density(
-                seeded_model, args, kwargs, model_param_map
-            )
-            check_model_guide_match(model_trace, guide_trace)
-            _validate_model(model_trace, plate_warning="loose")
+    def _single_particle_elbo(self, model, guide, param_map, args, kwargs, rng_key):
+        model_seed, guide_seed = random.split(rng_key)
+        seeded_model = seed(model, model_seed)
+        seeded_guide = seed(guide, guide_seed)
+        model_trace, guide_trace = get_importance_trace(
+            seeded_model, seeded_guide, args, kwargs, param_map
+        )
+        check_model_guide_match(model_trace, guide_trace)
+        _validate_model(model_trace, plate_warning="loose")
 
-            # log p(z) - log q(z)
-            elbo = model_log_density - guide_log_density
-            return elbo
+        site_plates = {
+            name: {frame for frame in site["cond_indep_stack"]}
+            for name, site in model_trace.items()
+            if site["type"] == "sample"
+        }
+        # We will compute Renyi elbos separately across dimensions
+        # defined in indep_plates. Then the final elbo is the sum
+        # of those independent elbos.
+        if site_plates:
+            indep_plates = set.intersection(*site_plates.values())
+        else:
+            indep_plates = set()
+        for frame in set.union(*site_plates.values()):
+            if frame not in indep_plates:
+                subsample_size = frame.size
+                size = model_trace[frame.name]["args"][0]
+                if size > subsample_size:
+                    raise ValueError(
+                        "RenyiELBO only supports subsampling in plates that are common"
+                        " to all sample sites, e.g. a data plate that encloses the"
+                        " entire model."
+                    )
+
+        indep_plate_scale = 1.0
+        for frame in indep_plates:
+            subsample_size = frame.size
+            size = model_trace[frame.name]["args"][0]
+            if size > subsample_size:
+                indep_plate_scale = indep_plate_scale * size / subsample_size
+        indep_plate_dims = {frame.dim for frame in indep_plates}
+
+        log_densities = {}
+        for trace_type, tr in {"guide": guide_trace, "model": model_trace}.items():
+            log_densities[trace_type] = 0.0
+            for site in tr.values():
+                if site["type"] != "sample":
+                    continue
+                log_prob = site["log_prob"]
+                squeeze_axes = ()
+                for dim in range(log_prob.ndim):
+                    neg_dim = dim - log_prob.ndim
+                    if neg_dim in indep_plate_dims:
+                        continue
+                    log_prob = jnp.sum(log_prob, axis=dim, keepdims=True)
+                    squeeze_axes = squeeze_axes + (dim,)
+                log_prob = jnp.squeeze(log_prob, squeeze_axes)
+                log_densities[trace_type] = log_densities[trace_type] + log_prob
+
+        # log p(z) - log q(z)
+        elbo = log_densities["model"] - log_densities["guide"]
+        # Log probabilities at indep_plates dimensions are scaled to MC approximate
+        # the "full size" log probabilities. Because we want to compute Renyi elbos
+        # separately across indep_plates dimensions, we will remove such scale now.
+        # We will apply such scale after getting those Renyi elbos.
+        return elbo / indep_plate_scale, indep_plate_scale
+
+    def loss(self, rng_key, param_map, model, guide, *args, **kwargs):
+        plate_key, rng_key = random.split(rng_key)
+        model = seed(
+            model, plate_key, hide_types=["sample", "prng_key", "control_flow"]
+        )
+        guide = seed(
+            guide, plate_key, hide_types=["sample", "prng_key", "control_flow"]
+        )
+        single_particle_elbo = partial(
+            self._single_particle_elbo, model, guide, param_map, args, kwargs
+        )
 
         rng_keys = random.split(rng_key, self.num_particles)
-        elbos = vmap(single_particle_elbo)(rng_keys)
+        if self.vectorize_particles:
+            elbos, common_plate_scale = vmap(single_particle_elbo)(rng_keys)
+        else:
+            elbos, common_plate_scale = jax.lax.map(single_particle_elbo, rng_keys)
+        assert common_plate_scale.shape == (self.num_particles,)
+        assert elbos.shape[0] == self.num_particles
         scaled_elbos = (1.0 - self.alpha) * elbos
-        avg_log_exp = logsumexp(scaled_elbos) - jnp.log(self.num_particles)
+        avg_log_exp = logsumexp(scaled_elbos, axis=0) - jnp.log(self.num_particles)
+        assert avg_log_exp.shape == elbos.shape[1:]
         weights = jnp.exp(scaled_elbos - avg_log_exp)
         renyi_elbo = avg_log_exp / (1.0 - self.alpha)
-        weighted_elbo = jnp.dot(stop_gradient(weights), elbos) / self.num_particles
-        return -(stop_gradient(renyi_elbo - weighted_elbo) + weighted_elbo)
+        weighted_elbo = (stop_gradient(weights) * elbos).mean(0)
+        assert renyi_elbo.shape == elbos.shape[1:]
+        assert weighted_elbo.shape == elbos.shape[1:]
+        loss = -(stop_gradient(renyi_elbo - weighted_elbo) + weighted_elbo)
+        # common_plate_scale should be the same across particles.
+        return loss.sum() * common_plate_scale[0]
 
 
 def _get_plate_stacks(trace):
@@ -612,8 +712,10 @@ class TraceGraph_ELBO(ELBO):
 
     can_infer_discrete = True
 
-    def __init__(self, num_particles=1):
-        super().__init__(num_particles=num_particles)
+    def __init__(self, num_particles=1, vectorize_particles=True):
+        super().__init__(
+            num_particles=num_particles, vectorize_particles=vectorize_particles
+        )
 
     def loss(self, rng_key, param_map, model, guide, *args, **kwargs):
         """
@@ -688,7 +790,10 @@ class TraceGraph_ELBO(ELBO):
             return -single_particle_elbo(rng_key)
         else:
             rng_keys = random.split(rng_key, self.num_particles)
-            return -jnp.mean(vmap(single_particle_elbo)(rng_keys))
+            if self.vectorize_particles:
+                return -jnp.mean(vmap(single_particle_elbo)(rng_keys))
+            else:
+                return -jnp.mean(jax.lax.map(single_particle_elbo, rng_keys))
 
 
 def get_importance_trace_enum(
@@ -870,9 +975,13 @@ class TraceEnum_ELBO(ELBO):
 
     can_infer_discrete = True
 
-    def __init__(self, num_particles=1, max_plate_nesting=float("inf")):
+    def __init__(
+        self, num_particles=1, max_plate_nesting=float("inf"), vectorize_particles=True
+    ):
         self.max_plate_nesting = max_plate_nesting
-        super().__init__(num_particles=num_particles)
+        super().__init__(
+            num_particles=num_particles, vectorize_particles=vectorize_particles
+        )
 
     def loss(self, rng_key, param_map, model, guide, *args, **kwargs):
         def single_particle_elbo(rng_key):
@@ -994,12 +1103,12 @@ class TraceEnum_ELBO(ELBO):
                     for key in deps:
                         site = guide_trace[key]
                         if site["infer"].get("enumerate") == "parallel":
-                            for plate in (
+                            for p in (
                                 frozenset(site["log_measure"].inputs) & elim_plates
                             ):
                                 raise ValueError(
                                     "Expected model enumeration to be no more global than guide enumeration, but found "
-                                    f"model enumeration sites upstream of guide site '{key}' in plate('{plate}')."
+                                    f"model enumeration sites upstream of guide site '{key}' in plate('{p}')."
                                     "Try converting some model enumeration sites to guide enumeration sites."
                                 )
                 cost_terms.append((cost, scale, deps))
@@ -1045,4 +1154,7 @@ class TraceEnum_ELBO(ELBO):
             return -single_particle_elbo(rng_key)
         else:
             rng_keys = random.split(rng_key, self.num_particles)
-            return -jnp.mean(vmap(single_particle_elbo)(rng_keys))
+            if self.vectorize_particles:
+                return -jnp.mean(vmap(single_particle_elbo)(rng_keys))
+            else:
+                return -jnp.mean(jax.lax.map(single_particle_elbo, rng_keys))

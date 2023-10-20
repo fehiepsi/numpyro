@@ -5,9 +5,13 @@ import jax
 from jax.api_util import flatten_fun, shaped_abstractify
 import jax.core as core
 from jax.experimental.pjit import pjit_p
+
+try:
+    import jax.extend.linear_util as lu
+except ImportError:
+    import jax.linear_util as lu
 from jax.interpreters.partial_eval import trace_to_jaxpr_dynamic
 from jax.interpreters.pxla import xla_pmap_p
-import jax.linear_util as lu
 import jax.numpy as jnp
 
 

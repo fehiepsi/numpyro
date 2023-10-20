@@ -141,6 +141,15 @@ def fori_loop(lower, upper, body_fun, init_val):
         return lax.fori_loop(lower, upper, body_fun, init_val)
 
 
+def is_prng_key(key):
+    try:
+        if jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key):
+            return key.shape == ()
+        return key.shape == (2,) and key.dtype == np.uint32
+    except AttributeError:
+        return False
+
+
 def not_jax_tracer(x):
     """
     Checks if `x` is not an array generated inside `jit`, `pmap`, `vmap`, or `lax_control_flow`.
@@ -715,19 +724,6 @@ def _format_table(rows):
         " ".join(cell.rjust(width) for cell, width in zip(row, cell_widths))
         for row in rows
     )
-
-
-def _versiontuple(version):
-    """
-    :param str version: Version, in string format.
-    Parse version string into tuple of ints.
-
-    Only to be used for the standard 'major.minor.patch' format,
-    such as ``'0.2.13'``.
-
-    Source: https://stackoverflow.com/a/11887825/4451315
-    """
-    return tuple([int(number) for number in version.split(".")])
 
 
 def find_stack_level() -> int:

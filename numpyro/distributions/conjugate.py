@@ -14,7 +14,8 @@ from numpyro.distributions.discrete import (
     ZeroInflatedDistribution,
 )
 from numpyro.distributions.distribution import Distribution
-from numpyro.distributions.util import is_prng_key, promote_shapes, validate_sample
+from numpyro.distributions.util import promote_shapes, validate_sample
+from numpyro.util import is_prng_key
 
 
 def _log_beta_1(alpha, value):
@@ -42,6 +43,7 @@ class BetaBinomial(Distribution):
     }
     has_enumerate_support = True
     enumerate_support = BinomialProbs.enumerate_support
+    pytree_data_fields = ("concentration1", "concentration0", "total_count", "_beta")
 
     def __init__(
         self, concentration1, concentration0, total_count=1, *, validate_args=None
@@ -109,6 +111,8 @@ class DirichletMultinomial(Distribution):
         "concentration": constraints.independent(constraints.positive, 1),
         "total_count": constraints.nonnegative_integer,
     }
+    pytree_data_fields = ("concentration", "_dirichlet")
+    pytree_aux_fields = ("total_count",)
 
     def __init__(self, concentration, total_count=1, *, validate_args=None):
         if jnp.ndim(concentration) < 1:
@@ -183,6 +187,7 @@ class GammaPoisson(Distribution):
         "rate": constraints.positive,
     }
     support = constraints.nonnegative_integer
+    pytree_data_fields = ("concentration", "rate", "_gamma")
 
     def __init__(self, concentration, rate=1.0, *, validate_args=None):
         self.concentration, self.rate = promote_shapes(concentration, rate)
@@ -275,6 +280,7 @@ class NegativeBinomial2(GammaPoisson):
         "concentration": constraints.positive,
     }
     support = constraints.nonnegative_integer
+    pytree_data_fields = ("concentration",)
 
     def __init__(self, mean, concentration, *, validate_args=None):
         rate = concentration / mean

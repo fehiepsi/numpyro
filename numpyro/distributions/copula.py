@@ -6,12 +6,8 @@ from jax import lax, numpy as jnp
 import numpyro.distributions.constraints as constraints
 from numpyro.distributions.continuous import Beta, MultivariateNormal, Normal
 from numpyro.distributions.distribution import Distribution
-from numpyro.distributions.util import (
-    clamp_probs,
-    is_prng_key,
-    lazy_property,
-    validate_sample,
-)
+from numpyro.distributions.util import clamp_probs, lazy_property, validate_sample
+from numpyro.util import is_prng_key
 
 
 class GaussianCopula(Distribution):
@@ -32,6 +28,8 @@ class GaussianCopula(Distribution):
         "correlation_matrix",
         "correlation_cholesky",
     ]
+
+    pytree_data_fields = ("marginal_dist", "base_dist")
 
     def __init__(
         self,
@@ -105,20 +103,6 @@ class GaussianCopula(Distribution):
     def correlation_cholesky(self):
         return self.base_dist.scale_tril
 
-    def tree_flatten(self):
-        marginal_flatten, marginal_aux = self.marginal_dist.tree_flatten()
-        return (marginal_flatten, self.base_dist.scale_tril), (
-            type(self.marginal_dist),
-            marginal_aux,
-        )
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, params):
-        marginal_flatten, correlation_cholesky = params
-        marginal_cls, marginal_aux = aux_data
-        marginal_dist = marginal_cls.tree_unflatten(marginal_aux, marginal_flatten)
-        return cls(marginal_dist, correlation_cholesky=correlation_cholesky)
-
 
 class GaussianCopulaBeta(GaussianCopula):
     arg_constraints = {
@@ -128,6 +112,7 @@ class GaussianCopulaBeta(GaussianCopula):
         "correlation_cholesky": constraints.corr_cholesky,
     }
     support = constraints.independent(constraints.unit_interval, 1)
+    pytree_data_fields = ("concentration1", "concentration0")
 
     def __init__(
         self,
@@ -146,17 +131,4 @@ class GaussianCopulaBeta(GaussianCopula):
             correlation_matrix,
             correlation_cholesky,
             validate_args=validate_args,
-        )
-
-    def tree_flatten(self):
-        return (
-            (self.concentration1, self.concentration0),
-            self.base_dist.scale_tril,
-        ), None
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, params):
-        (concentration1, concentration0), correlation_cholesky = params
-        return cls(
-            concentration1, concentration0, correlation_cholesky=correlation_cholesky
         )

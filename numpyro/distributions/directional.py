@@ -16,14 +16,13 @@ from jax.scipy.special import erf, i0e, i1e, logsumexp
 from numpyro.distributions import constraints
 from numpyro.distributions.distribution import Distribution
 from numpyro.distributions.util import (
-    is_prng_key,
     lazy_property,
     promote_shapes,
     safe_normalize,
     validate_sample,
     von_mises_centered,
 )
-from numpyro.util import while_loop
+from numpyro.util import is_prng_key, while_loop
 
 
 def _numel(shape):
@@ -214,6 +213,7 @@ class SineSkewed(Distribution):
     """
 
     arg_constraints = {"skewness": constraints.l1_ball}
+    pytree_data_fields = ("base_dist", "skewness")
 
     support = constraints.independent(constraints.circular, 1)
 
@@ -476,7 +476,7 @@ class SineBivariateVonMises(Distribution):
             phi_key, key = random.split(key)
             accept_key, acg_key, phi_key = random.split(phi_key, 3)
 
-            x = jnp.sqrt(1 + 2 * eig / b0) * random.normal(acg_key, shape)
+            x = lax.rsqrt(1 + 2 * eig / b0) * random.normal(acg_key, shape)
             x /= jnp.linalg.norm(
                 x, axis=1, keepdims=True
             )  # Angular Central Gaussian distribution
